@@ -1,0 +1,10 @@
+/__pycache__/
+/venv/
+/synth_images/
+/anim_demo_frames/
+/anim_demo.mp4
+/classifier.pth
+/ppo_demo/
+/ppo_full/
+/tmp_sample/
+/sample_vis.png
