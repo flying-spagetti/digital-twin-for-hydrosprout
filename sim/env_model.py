@@ -19,6 +19,7 @@ class EnvironmentModel:
         self.T = cfg.get('initial_T', 25.0)      # internal temperature (°C)
         self.C_air = cfg.get('C_air', 1.0)       # heat capacity constant
         self.U_loss = cfg.get('U_loss', 0.1)     # passive heat loss coeff
+        self.RH = cfg.get('initial_RH', 60.0)    # relative humidity (%)
 
         # Shield behavior
         self.shield_factor = cfg.get('shield_factor', 0.6)  # how much shield blocks light
@@ -47,8 +48,9 @@ class EnvironmentModel:
         # Heater adds heat
         Q_heater = heater_power * 1.0
 
-        # Fan increases cooling
+        # Fan increases cooling and reduces humidity
         fan_loss = 0.2 if fan_on else 0.0
+        fan_humidity_reduction = 5.0 if fan_on else 0.0  # fan reduces RH
 
         # Thermal ODE (discretized)
         dT = (
@@ -58,6 +60,11 @@ class EnvironmentModel:
 
         self.T = float(self.T + dT * self.dt)
 
+        # Humidity dynamics (simplified: increases with temp, decreases with fan)
+        # Base RH decreases slightly with temperature increase (more water vapor capacity)
+        dRH = -0.5 * (self.T - 20.0) / 20.0 - fan_humidity_reduction
+        self.RH = float(np.clip(self.RH + dRH * self.dt, 30.0, 90.0))
+
         # Light reaching plants
         L = float(np.clip(Q_sun * (1 - 0.3 * shield_pos), 0.0, 1.0))
 
@@ -66,6 +73,7 @@ class EnvironmentModel:
 
         return {
             "T": self.T,
+            "RH": self.RH,
             "L": L,
             "evap": evap_factor
         }

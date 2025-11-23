@@ -3,7 +3,7 @@
 DigitalTwinEnv
 --------------
 A Gymnasium environment that wraps together:
-- PlantModel
+- PlantStructuralAdapter (wraps PlantStructural model)
 - EnvironmentModel
 - HardwareModel
 - SensorModel
@@ -19,7 +19,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from sim.plant import PlantModel
+from sim.plant_adapter import PlantStructuralAdapter
 from sim.env_model import EnvironmentModel
 from sim.hardware import HardwareModel
 from sim.sensors import SensorModel
@@ -33,7 +33,7 @@ class DigitalTwinEnv(gym.Env):
         self.cfg = cfg or {}
 
         # Sub-models
-        self.plant = PlantModel(self.cfg.get('plant', {}))
+        self.plant = PlantStructuralAdapter(self.cfg.get('plant', {}))
         self.env = EnvironmentModel(self.cfg.get('env', {}))
         self.hw = HardwareModel(self.cfg.get('hardware', {}))
         self.sensors = SensorModel(self.cfg.get('sensors', {}))
@@ -59,7 +59,7 @@ class DigitalTwinEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.plant = PlantModel(self.cfg.get('plant', {}))
+        self.plant = PlantStructuralAdapter(self.cfg.get('plant', {}))
         self.env = EnvironmentModel(self.cfg.get('env', {}))
         self.hw = HardwareModel(self.cfg.get('hardware', {}))
         self.sensors = SensorModel(self.cfg.get('sensors', {}))
@@ -138,13 +138,14 @@ class DigitalTwinEnv(gym.Env):
             fan_on=self.hw.fan_on,
         )
 
-        # Plant update
+        # Plant update (pass env_state with RH for PlantStructural)
         plant_out = self.plant.step(
             env_out['L'],
             env_out['T'],
             env_out['evap'],
             water_input=hw_out['delivered_water'],
-            nutrient_input=0.0
+            nutrient_input=0.0,
+            env_state=env_out  # Pass full env_state so adapter can extract RH
         )
 
         # Next observation

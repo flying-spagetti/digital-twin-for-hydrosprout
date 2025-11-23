@@ -11,3 +11,4 @@ torchvision
 albumentations
 tqdm
 pandas
+plotly
