@@ -1,0 +1,25 @@
+sim:
+dt_hours: 1
+episode_length_days: 14
+plant:
+r_base: 0.02
+k_l: 0.2
+M_opt: 0.45
+sigma_m: 0.2
+T_opt: 20.0
+sigma_t: 6.0
+k_n: 0.2
+decay_rate: 0.001
+env:
+evap_base: 0.01
+beta_L: 0.5
+tau_evap: 10.0
+percolation: 0.01
+hardware:
+pump_latency_steps: 1
+fan_cooling_rate: 0.05
+shield_light_factor: 0.4
+reward:
+w_c: 1.0
+w_m: 5.0
+w_e: 0.1

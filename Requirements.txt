@@ -1,0 +1,13 @@
+numpy
+scipy
+matplotlib
+opencv-python
+Pillow
+PyYAML
+gymnasium
+stable-baselines3
+torch
+torchvision
+albumentations
+tqdm
+pandas
