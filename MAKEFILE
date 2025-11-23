@@ -1,0 +1,25 @@
+# Makefile for digital-twin project
+
+.PHONY: install gen_synth demo_ppo train_classifier sim_run clean
+
+install:
+	python -m venv venv
+	. venv/bin/activate && pip install -r requirements.txt
+
+gen_synth:
+	python vision/synth_generator.py
+
+demo_ppo:
+	python rl/train_ppo.py --demo
+
+train_classifier:
+	python vision/train_classifier.py
+
+sim_run:
+	python main.py sim_run --steps 48
+
+sample_visual:
+	python main.py sample_visual --out sample_vis.png
+
+clean:
+	rm -rf synth_images anim_demo_frames anim_demo.mp4 classifier.pth ppo_demo ppo_full tmp_sample
