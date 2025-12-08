@@ -1,0 +1,77 @@
+# species_presets_extended.yaml
+kale:
+  description: "Kale microgreens"
+  A_max: 0.030
+  SLA_cm2_per_g: 220
+  alloc_leaf: 0.55
+  alloc_stem: 0.25
+  alloc_root: 0.20
+  nutrient_demand:
+    N: 0.55
+    P: 0.25
+    K: 0.40
+  micronutrient_demand:
+    Fe: 0.012
+    Mn: 0.005
+    Zn: 0.003
+    Cu: 0.0008
+    B: 0.0015
+    Mo: 0.0002
+    Se: 0.00005
+    Cl: 0.002
+  micronutrient_toxicity_threshold:
+    Fe: 0.9
+    Mn: 0.9
+    Zn: 0.9
+    Cu: 0.6
+    Se: 0.4
+    B: 0.8
+
+broccoli:
+  description: "Broccoli microgreens"
+  A_max: 0.028
+  SLA_cm2_per_g: 200
+  alloc_leaf: 0.50
+  alloc_stem: 0.30
+  alloc_root: 0.20
+  nutrient_demand:
+    N: 0.50
+    P: 0.30
+    K: 0.40
+  micronutrient_demand:
+    Fe: 0.011
+    Mn: 0.004
+    Zn: 0.0035
+    Cu: 0.0007
+    B: 0.0012
+    Mo: 0.00015
+    Se: 0.00004
+    Cl: 0.002
+  micronutrient_toxicity_threshold:
+    Cu: 0.6
+    Se: 0.35
+
+radish:
+  description: "Radish microgreens"
+  A_max: 0.035
+  SLA_cm2_per_g: 180
+  alloc_leaf: 0.60
+  alloc_stem: 0.20
+  alloc_root: 0.20
+  nutrient_demand:
+    N: 0.45
+    P: 0.20
+    K: 0.35
+  micronutrient_demand:
+    Fe: 0.010
+    Mn: 0.004
+    Zn: 0.0025
+    Cu: 0.0006
+    B: 0.001
+    Mo: 0.00012
+    Se: 0.00003
+    Cl: 0.0018
+  micronutrient_toxicity_threshold:
+    Se: 0.35
+
+# you can add broccoli, beet, cabbage similarly...

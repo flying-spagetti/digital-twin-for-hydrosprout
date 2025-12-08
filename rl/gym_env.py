@@ -1,36 +1,42 @@
 # rl/gym_env.py
 """
-DigitalTwinEnv
---------------
-A Gymnasium environment that wraps together:
-- PlantStructuralAdapter (wraps PlantStructural model)
-- EnvironmentModel
-- HardwareModel
-- SensorModel
-
-This environment provides a unified RL interface with:
-    observation: sensor readings
-    action: water, fan, shield movement, heater
-
-The environment simulates 14 days with 1-hour timesteps.
+Fixed DigitalTwinEnv (Gymnasium)
+- Uses PlantStructuralAdapter properly (reads plant.plant.* attributes when available)
+- Safe action scaling (water limited to small liters per step)
+- Curriculum-driven disable_actions via options['curriculum']
+- Reward uses canopy *delta*, moisture-band reward, strong overwater/overheat termination
+- Returns rich info for debugging (action usage, death reason, soil_status)
 """
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+from typing import Optional, Tuple
 
 from sim.plant_adapter import PlantStructuralAdapter
 from sim.env_model import EnvironmentModel
 from sim.hardware import HardwareModel
 from sim.sensors import SensorModel
 
+# --- Defaults you can tune ---
+DEFAULT_MAX_WATER_L = 0.05    # maximum liters delivered if action=1.0 (50 ml)
+DEFAULT_MAX_SHIELD_DELTA = 0.15  # max shield position change per step (normalized)
+MAX_TEMP_TERMINATE = 38.0
+OVERWATER_TERMINATE_THRESH = 0.95
+OVERWATER_WARN_THRESH = 0.85
+MOISTURE_OPT = 0.50
+MOISTURE_BAND = 0.15
+DEATH_PENALTY = -1000.0
 
 class DigitalTwinEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, cfg=None):
+    def __init__(self, cfg: Optional[dict] = None):
         super().__init__()
-        self.cfg = cfg or {}
+        self.cfg = cfg.copy() if cfg else {}
+        self.use_extended_obs = self.cfg.get('use_extended_obs', False)
+        self.include_soil_obs = self.cfg.get('include_soil_obs', False)
+        self.include_nutrient_actions = self.cfg.get('include_nutrient_actions', False)
 
         # Sub-models
         self.plant = PlantStructuralAdapter(self.cfg.get('plant', {}))
@@ -38,145 +44,440 @@ class DigitalTwinEnv(gym.Env):
         self.hw = HardwareModel(self.cfg.get('hardware', {}))
         self.sensors = SensorModel(self.cfg.get('sensors', {}))
 
-        # Observation space (normalized values)
-        # [canopy, moisture, nutrient, mold, temp_scaled, lux, shield_pos]
-        low = np.array([0.0] * 7, dtype=np.float32)
-        high = np.array([1.0] * 7, dtype=np.float32)
+        # Observation dimension calculation (same as your previous design)
+        obs_dim = 7
+        if self.use_extended_obs:
+            obs_dim += 5
+            if self.include_soil_obs:
+                obs_dim += 6
+
+        low = np.array([0.0] * obs_dim, dtype=np.float32)
+        high = np.array([1.0] * obs_dim, dtype=np.float32)
         self.observation_space = spaces.Box(low, high, dtype=np.float32)
 
-        # Action space: [water, fan, shield_delta, heater]
-        self.action_space = spaces.Box(
-            low=np.array([0, 0, -1, 0], dtype=np.float32),
-            high=np.array([1, 1, 1, 1], dtype=np.float32),
-            dtype=np.float32,
-        )
+        # Action space
+        if self.include_nutrient_actions:
+            # water, fan, shield_delta, heater, dose_N, dose_P, dose_K
+            self.action_space = spaces.Box(
+                low=np.array([0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+                dtype=np.float32
+            )
+        else:
+            # water, fan, shield_delta, heater
+            self.action_space = spaces.Box(
+                low=np.array([0.0, 0.0, -1.0, 0.0], dtype=np.float32),
+                high=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+                dtype=np.float32
+            )
 
+        # Internal clocks
         self.hour = 6
         self.step_count = 0
-        self.max_steps = 24 * 14
+        # default 14 days hourly
+        self.max_steps = int(self.cfg.get('max_steps', 24 * 14))
 
-    # ------------------------------------------------------------------
-    def reset(self, seed=None, options=None):
+        # safe-action / curriculum
+        self.disable_actions = set()  # set of names: 'water','fan','shield','heater'
+        # scaled knobs
+        self.max_water_l = float(self.cfg.get('max_water_per_step_l', DEFAULT_MAX_WATER_L))
+        self.max_shield_delta = float(self.cfg.get('max_shield_delta', DEFAULT_MAX_SHIELD_DELTA))
+
+        # state bookkeeping for rewards
+        self._last_canopy = None
+        self._last_moist = None
+
+    # ------------------------
+    # Reset / options handling
+    # ------------------------
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        # gymnasium recommended call
         super().reset(seed=seed)
 
+        # If a curriculum/options dict was provided, apply it.
+        # Expect options['curriculum'] as generated by CurriculumWrapper
+        if options and isinstance(options, dict) and 'curriculum' in options:
+            curr_cfg = options['curriculum'] or {}
+            # env section
+            env_cfg = curr_cfg.get('env')
+            plant_cfg = curr_cfg.get('plant')
+            # disable actions list
+            disable = curr_cfg.get('disable_actions') or curr_cfg.get('disable', [])
+            if env_cfg:
+                self.cfg.setdefault('env', {}).update(env_cfg)
+                # allow env to set max_steps directly via curriculum config
+                if 'max_steps' in env_cfg:
+                    self.max_steps = int(env_cfg['max_steps'])
+            if plant_cfg:
+                self.cfg.setdefault('plant', {}).update(plant_cfg)
+            if disable:
+                self.disable_actions = set(disable)
+
+        # Recreate submodels with updated cfg
         self.plant = PlantStructuralAdapter(self.cfg.get('plant', {}))
         self.env = EnvironmentModel(self.cfg.get('env', {}))
         self.hw = HardwareModel(self.cfg.get('hardware', {}))
         self.sensors = SensorModel(self.cfg.get('sensors', {}))
 
+        # reset clocks & reward history
         self.hour = 6
         self.step_count = 0
+        self._last_canopy = None
+        self._last_moist = None
 
-        obs=self._get_obs()
-        info={}
-        return obs, info
+        obs = self._get_obs()
+        return obs, {}
 
-    # ------------------------------------------------------------------
+    # ------------------------
+    # Helpers
+    # ------------------------
     def _env_step_passive(self):
-        """Perform environment step to get temp/light/evap values."""
         return self.env.step(
             self.hour,
             shield_pos=self.hw.shield_pos,
             heater_power=0.0,
-            fan_on=self.hw.fan_on,
+            fan_on=self.hw.fan_on
         )
 
-    # ------------------------------------------------------------------
+    def _get_plant_scalar_states(self) -> Tuple[float, float, float, float]:
+        """
+        Returns canopy (0..1), moisture (0..1), nutrient (0..1), pmold (0..1)
+        Safely extracts values from PlantStructuralAdapter which may wrap structural model.
+        """
+        # default fallbacks
+        canopy = 0.0
+        moisture = 0.35
+        nutrient = 0.5
+        pmold = 0.0
+
+        # PlantStructuralAdapter should expose high-level scalars for compatibility.
+        # Try common attributes first, then fallback to structural internals.
+        if hasattr(self.plant, 'C'):
+            try:
+                canopy = float(self.plant.C)
+            except Exception:
+                canopy = 0.0
+        else:
+            # structural fallback
+            p = getattr(self.plant, 'plant', None)
+            if p is not None and hasattr(p, 'canopy_cover'):
+                canopy = float(getattr(p, 'canopy_cover', 0.0))
+
+        if hasattr(self.plant, 'M'):
+            try:
+                moisture = float(self.plant.M)
+            except Exception:
+                moisture = moisture
+        else:
+            p = getattr(self.plant, 'plant', None)
+            if p is not None and hasattr(p, 'soil_theta'):
+                moisture = float(getattr(p, 'soil_theta', moisture))
+
+        if hasattr(self.plant, 'N'):
+            try:
+                nutrient = float(self.plant.N)
+            except Exception:
+                nutrient = nutrient
+        else:
+            p = getattr(self.plant, 'plant', None)
+            if p is not None:
+                soil = getattr(p, 'soil', None)
+                if soil is not None and hasattr(soil, 'soil_N'):
+                    # soil.status() may be present otherwise
+                    try:
+                        nutrient = float(getattr(soil, 'soil_N', nutrient))
+                    except Exception:
+                        nutrient = nutrient
+
+        if hasattr(self.plant, 'P_mold'):
+            try:
+                pmold = float(self.plant.P_mold)
+            except Exception:
+                pmold = pmold
+        else:
+            p = getattr(self.plant, 'plant', None)
+            if p is not None and hasattr(p, 'mold_prob'):
+                # average mold prob across plants
+                try:
+                    mp = getattr(p, 'mold_prob', None)
+                    if mp is not None:
+                        pmold = float(np.mean(mp))
+                except Exception:
+                    pmold = pmold
+
+        # clip
+        canopy = float(np.clip(canopy, 0.0, 1.0))
+        moisture = float(np.clip(moisture, 0.0, 1.0))
+        nutrient = float(np.clip(nutrient, 0.0, 1.0))
+        pmold = float(np.clip(pmold, 0.0, 1.0))
+
+        return canopy, moisture, nutrient, pmold
+
     def _get_obs(self):
         env_s = self._env_step_passive()
+        canopy, moisture, nutrient, pmold = self._get_plant_scalar_states()
 
-        plant_state = {
-            'C': self.plant.C,
-            'M': self.plant.M,
-            'N': self.plant.N,
-            'P_mold': self.plant.P_mold,
-        }
-        hw_state = {
-            'shield_pos': self.hw.shield_pos,
-            'fan_on': self.hw.fan_on,
-        }
+        # build base obs
+        obs_list = [
+            canopy,
+            moisture,
+            nutrient,
+            pmold,
+            float(env_s.get('T', 20.0) / 40.0),
+            float(env_s.get('L', 0.0)),   # normalized light approx
+            float(self.hw.shield_pos if hasattr(self.hw, 'shield_pos') else 0.0)
+        ]
 
-        sens = self.sensors.read_all(plant_state, env_s, hw_state)
+        # extended observations
+        if self.use_extended_obs:
+            # try to extract structural internals
+            p = getattr(self.plant, 'plant', None)
+            if p is not None:
+                # LAI normalized by 5
+                lai = float(getattr(p, 'LAI', 0.0))
+                obs_list.append(float(np.clip(lai / 5.0, 0.0, 1.0)))
 
-        obs = np.array(
-            [
-                sens['canopy'],
-                sens['moisture'],
-                sens['nutrient'],
-                sens['pmold'],
-                sens['temp'] / 40.0,  # scale approx
-                sens['lux'],
-                self.hw.shield_pos,
-            ],
-            dtype=np.float32,
-        )
-        return obs
+                # biomass: safe sums if present
+                try:
+                    leaf_b = float(np.sum(getattr(p, 'B_leaf', np.zeros(1))))
+                    root_b = float(np.sum(getattr(p, 'B_root', np.zeros(1))))
+                    n_plants = getattr(p, 'n', 1)
+                    max_bio = max(1.0, float(n_plants * 10.0))
+                    obs_list.append(float(np.clip(leaf_b / (max_bio * 0.5), 0.0, 1.0)))
+                    obs_list.append(float(np.clip(root_b / (max_bio * 0.2), 0.0, 1.0)))
+                except Exception:
+                    obs_list.extend([0.0, 0.0])
 
-    # ------------------------------------------------------------------
+                # transpiration (from last diagnostics if available)
+                transp = float(getattr(p, '_last_transp', 0.0))
+                obs_list.append(float(np.clip(transp / (max(1, getattr(p, 'n',1)) * 0.1), 0.0, 1.0)))
+
+                # RH normalized (30-90)
+                rh = float(env_s.get('RH', 60.0))
+                obs_list.append(float(np.clip((rh - 30.0) / 60.0, 0.0, 1.0)))
+
+                # soil observations if requested
+                if self.include_soil_obs:
+                    soil = getattr(p, 'soil', None)
+                    if soil is not None:
+                        s = soil.status() if callable(getattr(soil, 'status', None)) else {}
+                        ph = float(s.get('pH', 6.0))
+                        ec = float(s.get('ec', 0.0))
+                        n = float(s.get('soil_N', 0.0))
+                        P = float(s.get('soil_P', 0.0))
+                        K = float(s.get('soil_K', 0.0))
+                        fe = float(s.get('soil_Fe', s.get('Fe', 0.0)))
+                        obs_list.extend([
+                            float(np.clip((ph - 4.0) / 4.0, 0.0, 1.0)),
+                            float(np.clip(ec / 3.0, 0.0, 1.0)),
+                            float(np.clip(n, 0.0, 1.0)),
+                            float(np.clip(P, 0.0, 1.0)),
+                            float(np.clip(K, 0.0, 1.0)),
+                            float(np.clip(fe, 0.0, 1.0)),
+                        ])
+                    else:
+                        obs_list.extend([0.0] * 6)
+            else:
+                # fallback zeros if no structural internals
+                extra = self.observation_space.shape[0] - len(obs_list)
+                obs_list.extend([0.0] * extra)
+
+        return np.array(obs_list, dtype=np.float32)
+
+    # ------------------------
+    # Step
+    # ------------------------
     def step(self, action):
-        # Decode action
-        water = float(action[0])
-        fan = int(round(float(action[1])))
-        shield_delta = float(action[2])
-        heater = float(action[3])
+        # defensive copy
+        action = np.array(action, copy=True, dtype=float)
 
-        # Hardware step
-        hw_out = self.hw.step(
-            {
-                'water': water,
-                'fan': fan,
-                'shield': shield_delta,
-                'heater': heater,
+        # apply curriculum-disable mask if any
+        if 'water' in self.disable_actions:
+            action[0] = 0.0
+        if 'fan' in self.disable_actions and action.shape[0] > 1:
+            action[1] = 0.0
+        if 'shield' in self.disable_actions and action.shape[0] > 2:
+            action[2] = 0.0
+        if 'heater' in self.disable_actions and action.shape[0] > 3:
+            action[3] = 0.0
+
+        # Unpack action safely
+        water_a = float(action[0]) if action.shape[0] >= 1 else 0.0
+        fan_a = float(action[1]) if action.shape[0] >= 2 else 0.0
+        shield_a = float(action[2]) if action.shape[0] >= 3 else 0.0
+        heater_a = float(action[3]) if action.shape[0] >= 4 else 0.0
+
+        # scale actions to physical units (safe clipping)
+        water_l = float(np.clip(water_a, 0.0, 1.0)) * self.max_water_l
+        fan_on = bool(round(np.clip(fan_a, 0.0, 1.0)))
+        # clamp shield delta magnitude
+        shield_delta = float(np.clip(shield_a, -1.0, 1.0)) * self.max_shield_delta
+        heater_power = float(np.clip(heater_a, 0.0, 1.0))
+
+        # Optional nutrient dosing (if included)
+        nutrient_dose = None
+        if self.include_nutrient_actions and action.shape[0] >= 7:
+            nutrient_dose = {
+                'N': float(np.clip(action[4], 0.0, 1.0)),
+                'P': float(np.clip(action[5], 0.0, 1.0)),
+                'K': float(np.clip(action[6], 0.0, 1.0)),
+                'micro': None,
+                'chelated': False
             }
-        )
+            # note: trainer or hardware should map these 0..1 doses to mg/L in real mapping
 
-        # Environment step (active)
+        # 1) Hardware step (deliver water etc.)
+        hw_out = self.hw.step({
+            'water': water_l,
+            'fan': int(fan_on),
+            'shield': shield_delta,
+            'heater': heater_power
+        })
+
+        # 2) Environment step (T, RH, L, evap)
         env_out = self.env.step(
             self.hour,
             shield_pos=self.hw.shield_pos,
-            heater_power=hw_out['heater_power'],
-            fan_on=self.hw.fan_on,
+            heater_power=hw_out.get('heater_power', heater_power),
+            fan_on=self.hw.fan_on
         )
 
-        # Plant update (pass env_state with RH for PlantStructural)
+        # 3) Plant step (adapter interface)
+        # The adapter uses the older API signatures; forward what we have.
         plant_out = self.plant.step(
-            env_out['L'],
-            env_out['T'],
-            env_out['evap'],
-            water_input=hw_out['delivered_water'],
-            nutrient_input=0.0,
-            env_state=env_out  # Pass full env_state so adapter can extract RH
+            env_out.get('L', 0.0),
+            env_out.get('T', 20.0),
+            env_out.get('evap', 0.0),
+            water_input=hw_out.get('delivered_water', 0.0),
+            nutrient_input=nutrient_dose if nutrient_dose is not None else 0.0,
+            env_state=env_out
         )
 
-        # Next observation
+        # Try to capture structural diagnostics to store for obs
+        pcore = getattr(self.plant, 'plant', None)
+        if pcore is not None and isinstance(plant_out, dict):
+            # some plant_outs contain 'diagnostics' or 'transpiration' keys
+            diag = plant_out.get('diagnostics') or plant_out.get('diagnostic') or plant_out
+            if isinstance(diag, dict) and 'transp_total_liters' in diag:
+                setattr(pcore, '_last_transp', float(diag.get('transp_total_liters', 0.0)))
+
+        # Build observation
         obs = self._get_obs()
 
-        # Reward
-        energy_cost = self.hw.energy
-        reward = (
-            self.plant.C * 2.0
-            - self.plant.P_mold * 5.0
-            - 0.01 * energy_cost
-            - abs(self.plant.M - 0.45)  # moisture optimal penalty
-        )
+        # Determine plant scalar states for reward & termination
+        canopy, moisture, nutrient, pmold = self._get_plant_scalar_states()
 
-        # Time update
+        # Reward shaping
+        # canopy delta (use previous canopy if available)
+        if self._last_canopy is None:
+            canopy_delta = 0.0
+        else:
+            canopy_delta = float(canopy - self._last_canopy)
+        self._last_canopy = canopy
+
+        # moisture delta for encouragement of corrective watering
+        if self._last_moist is None:
+            moist_delta = 0.0
+        else:
+            moist_delta = float(moisture - self._last_moist)
+        self._last_moist = moisture
+
+        # base reward components
+        # encourage canopy growth (delta), discourage mold, reward moisture in-band, punish large energy usage mildly
+        w_canopy = float(self.cfg.get('w_canopy', 10.0))
+        w_mold = float(self.cfg.get('w_mold', 5.0))
+        w_energy = float(self.cfg.get('w_energy', 0.001))
+        w_moist = float(self.cfg.get('w_moisture', 3.0))
+        w_temp = float(self.cfg.get('w_temp', 2.0))
+
+        reward = 0.0
+        # canopy growth (positive only)
+        reward += w_canopy * max(0.0, canopy_delta)
+
+        # mold penalty (quadratic to discourage spikes)
+        reward -= w_mold * (pmold ** 2)
+
+        # energy penalty (very small)
+        reward -= w_energy * float(self.hw.energy)
+
+        # moisture band reward (bell-shaped)
+        m_opt = float(self.cfg.get('moisture_opt', MOISTURE_OPT))
+        m_band = float(self.cfg.get('moisture_band', MOISTURE_BAND))
+        # gaussian-like reward for being close to m_opt
+        moist_dist = abs(moisture - m_opt)
+        if moist_dist <= m_band:
+            reward += w_moist * np.exp(-((moist_dist) / (m_band/2.0))**2)
+        else:
+            # outside band => linear penalty scaled
+            reward -= w_moist * (moist_dist - m_band) * 1.5
+
+        # temperature band reward/penalty
+        t_opt = float(self.cfg.get('temp_opt', 22.0))
+        t_band = float(self.cfg.get('temp_band', 5.0))
+        t_curr = float(env_out.get('T', t_opt))
+        t_dist = abs(t_curr - t_opt)
+        if t_dist <= t_band:
+            reward += w_temp * np.exp(-((t_dist) / (t_band/2.0))**2)
+        else:
+            reward -= w_temp * (t_dist - t_band) * 1.0
+
+        # small bonus for actively correcting moisture in reasonable increments (not for overshoot)
+        if moist_delta > 0.01 and moisture <= OVERWATER_WARN_THRESH:
+            reward += 1.0
+
+        # Overwater & Overheat checks -> termination with large penalty
+        terminated = False
+        truncated = False
+        death_reason = None
+        if moisture >= OVERWATER_TERMINATE_THRESH:
+            terminated = True
+            reward += DEATH_PENALTY
+            death_reason = 'flooded_overwater'
+        elif t_curr >= MAX_TEMP_TERMINATE:
+            terminated = True
+            reward += DEATH_PENALTY
+            death_reason = 'overheat'
+        else:
+            # check plant-level dead condition if adapter provides it
+            try:
+                if hasattr(self.plant, 'is_dead') and callable(getattr(self.plant, 'is_dead')):
+                    plant_dead = self.plant.is_dead(temp=t_curr)
+                    if plant_dead:
+                        terminated = True
+                        reward += DEATH_PENALTY
+                        death_reason = getattr(self.plant, 'get_death_reason', lambda temp=None: 'plant_dead')(t_curr)
+            except Exception:
+                # ignore adapter errors in step; do not crash env
+                pass
+
+        # step bookkeeping
         self.step_count += 1
         self.hour = (self.hour + 1) % 24
+        if self.step_count >= self.max_steps:
+            truncated = True
 
-        #done = self.step_count >= self.max_steps
-        terminated=False
-        truncated=self.step_count >= self.max_steps #Episode ends because of time limit
+        # Compose info
         info = {
             'plant': plant_out,
             'env': env_out,
             'hw': hw_out,
+            'action_physical': {
+                'water_l': water_l,
+                'fan_on': int(self.hw.fan_on),
+                'shield_pos': float(self.hw.shield_pos),
+                'heater_power': float(hw_out.get('heater_power', heater_power))
+            },
+            'disable_actions': list(self.disable_actions),
+            'death_reason': death_reason,
+            'curr_step': self.step_count
         }
 
-        return obs, reward, terminated, truncated, info
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
-    # ------------------------------------------------------------------
+    # ------------------------
+    # Render
+    # ------------------------
     def render(self):
-        print(
-            f"Hour {self.hour} | Canopy {self.plant.C:.3f} | Moist {self.plant.M:.3f} | Temp {self.env.T:.2f}"
-        )
+        canopy, moisture, _, _ = self._get_plant_scalar_states()
+        print(f"Hour {self.hour} | Step {self.step_count}/{self.max_steps} | Canopy {canopy:.3f} | Moist {moisture:.3f} | T {self.env.T:.2f}")
+

@@ -19,6 +19,10 @@ import logging
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+from viz.analyze_sim_logs import main as analyze_sim_logs
+from stable_baselines3 import PPO
+
+
 
 # Ensure project root is on PYTHONPATH
 ROOT = Path(__file__).resolve().parent
@@ -54,10 +58,99 @@ def train_classifier_cmd(args):
     print(f"[main] Training classifier on '{data_dir}' for {epochs} epochs ...")
     train_classifier.train(data_dir=data_dir, epochs=epochs)
     print("[main] Classifier training done.")
-
 def sim_run(args):
     steps = args.steps or 48
+    
+    # Prepare nutrient dose if specified
+    nutrient_dose = None
+    if hasattr(args, 'dose_nutrients') and (args.dose_nutrients or args.dose_N is not None or args.dose_P is not None or args.dose_K is not None):
+        nutrient_dose = {
+            'N': args.dose_N if hasattr(args, 'dose_N') and args.dose_N is not None else (0.1 if hasattr(args, 'dose_nutrients') and args.dose_nutrients else 0.0),
+            'P': args.dose_P if hasattr(args, 'dose_P') and args.dose_P is not None else (0.05 if hasattr(args, 'dose_nutrients') and args.dose_nutrients else 0.0),
+            'K': args.dose_K if hasattr(args, 'dose_K') and args.dose_K is not None else (0.1 if hasattr(args, 'dose_nutrients') and args.dose_nutrients else 0.0),
+            'micro': None,  # Can be extended later
+            'chelated': False
+        }
+    
+    # Try to load trained model if specified or auto-detect
+    model = None
+    if args.no_model:
+        model_path = None
+    else:
+        model_path = args.model if hasattr(args, 'model') and args.model else None
+        
+        if not model_path:
+            # Auto-detect best available model
+            best_model = ROOT / "ppo_best" / "best_model.zip"
+            full_model = ROOT / "ppo_full.zip"
+            demo_model = ROOT / "ppo_demo.zip"
+            
+            if best_model.exists():
+                model_path = str(best_model)
+    
     env = DigitalTwinEnv()
+    
+    # Apply initial nutrient dose if provided
+    if nutrient_dose and hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'soil'):
+        env.plant.plant.soil.add_dose(
+            N=nutrient_dose['N'],
+            P=nutrient_dose['P'],
+            K=nutrient_dose['K'],
+            micro=nutrient_dose.get('micro'),
+            chelated=nutrient_dose.get('chelated', False)
+        )
+        print(f"[main] Applied initial nutrient dose: N={nutrient_dose['N']:.3f}, P={nutrient_dose['P']:.3f}, K={nutrient_dose['K']:.3f}")
+    
+    # If model path found, try to load it
+    if model_path and Path(model_path).exists():
+        try:
+            print(f"[main] Loading trained PPO model from {model_path}")
+            # Try to detect observation space from model metadata
+            # First, try loading without env to check observation space
+            try:
+                temp_model = PPO.load(model_path)
+                model_obs_dim = temp_model.observation_space.shape[0]
+                print(f"[main] Model expects observation space dimension: {model_obs_dim}")
+                
+                # Determine if we need extended observations
+                use_extended = getattr(args, 'use_extended_obs', False)
+                if model_obs_dim > 7:
+                    # Model was trained with extended observations
+                    use_extended = True
+                    print(f"[main] Model was trained with extended observations, enabling extended mode")
+                
+                # Create environment with matching observation space
+                env_cfg = {}
+                if use_extended:
+                    env_cfg['use_extended_obs'] = True
+                
+                # Recreate env with correct config
+                env = DigitalTwinEnv(cfg=env_cfg)
+                
+                # Re-apply nutrient dose if env was recreated
+                if nutrient_dose and hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'soil'):
+                    env.plant.plant.soil.add_dose(
+                        N=nutrient_dose['N'],
+                        P=nutrient_dose['P'],
+                        K=nutrient_dose['K'],
+                        micro=nutrient_dose.get('micro'),
+                        chelated=nutrient_dose.get('chelated', False)
+                    )
+                
+                # Now load model with correct environment
+                model = PPO.load(model_path, env=env)
+                print(f"[main] Successfully loaded trained model")
+            except Exception as e2:
+                print(f"[main] Error during model inspection: {e2}")
+                raise e2
+        except Exception as e:
+            print(f"[main] Warning: Could not load model {model_path}: {e}")
+            print(f"[main] Falling back to naive policy")
+            model = None
+    else:
+        if model_path:
+            print(f"[main] Model path specified but not found: {model_path}")
+        print(f"[main] No trained model found, using naive policy")
     
     # Setup logging
     log_dir = ROOT / "logs"
@@ -80,6 +173,12 @@ def sim_run(args):
     logger.info(f"SIMULATION RUN STARTED")
     logger.info(f"Steps: {steps}")
     logger.info(f"Log file: {log_file}")
+    if model:
+        logger.info(f"Using trained PPO model: {model_path}")
+    else:
+        logger.info("Using naive/heuristic policy")
+    if nutrient_dose:
+        logger.info(f"Initial nutrient dose: N={nutrient_dose['N']:.3f}, P={nutrient_dose['P']:.3f}, K={nutrient_dose['K']:.3f}")
     logger.info("="*80)
     
     # Reset environment
@@ -90,7 +189,10 @@ def sim_run(args):
     logger.info(f"Max steps: {env.max_steps}")
     
     # Log initial observation
-    canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs
+    if len(obs) >= 7:
+        canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[:7]
+    else:
+        canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6] if len(obs) > 6 else 0.0
     temp = tmp_scaled * 40.0
     logger.info("Initial Observation:")
     logger.info(f"  Canopy: {canopy:.4f}")
@@ -114,6 +216,22 @@ def sim_run(args):
         logger.info(f"  Total root biomass: {np.sum(env.plant.plant.B_root):.4f} g")
         logger.info(f"  Total stem biomass: {np.sum(env.plant.plant.B_stem):.4f} g")
         logger.info(f"  Number of plants: {env.plant.plant.n}")
+        
+        # Log soil status if SoilModelExtended is available
+        if hasattr(env.plant.plant, 'soil'):
+            soil = env.plant.plant.soil
+            soil_status = soil.status()
+            logger.info("Initial Soil Status:")
+            logger.info(f"  pH: {soil_status.get('pH', 0):.2f}")
+            logger.info(f"  EC proxy: {soil_status.get('ec', 0):.3f}")
+            logger.info(f"  Macronutrients:")
+            logger.info(f"    N: {soil_status.get('soil_N', 0):.4f}")
+            logger.info(f"    P: {soil_status.get('soil_P', 0):.4f}")
+            logger.info(f"    K: {soil_status.get('soil_K', 0):.4f}")
+            logger.info(f"  Micronutrients:")
+            for micro in ['Fe', 'Mn', 'Zn', 'Cu', 'B', 'Mo']:
+                if f'soil_{micro}' in soil_status:
+                    logger.info(f"    {micro}: {soil_status[f'soil_{micro}']:.4f}")
     
     # Log initial environment state
     logger.info("Initial Environment State:")
@@ -138,7 +256,10 @@ def sim_run(args):
         logger.info(f"{'='*80}")
         
         # Log current observation
-        canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs
+        if len(obs) >= 7:
+            canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[:7]
+        else:
+            canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6] if len(obs) > 6 else 0.0
         temp = tmp_scaled * 40.0
         logger.info("Current Observation:")
         logger.info(f"  Canopy: {canopy:.4f}")
@@ -149,23 +270,31 @@ def sim_run(args):
         logger.info(f"  Lux: {lux:.4f}")
         logger.info(f"  Shield position: {shield_pos:.4f}")
         
-        # Determine action (naive policy)
-        action = [0.0, 0.0, 0.0, 0.0]  # water, fan, shield_delta, heater
-        action_reasons = []
-        
-        if moist < 0.35:
-            action[0] = 0.8  # water
-            action_reasons.append(f"Low moisture ({moist:.3f} < 0.35)")
-        if temp > 28.0:
-            action[1] = 1.0  # fan on
-            action[2] = 0.2  # open shield slightly
-            action_reasons.append(f"High temperature ({temp:.2f}°C > 28°C)")
-        if temp < 16.0:
-            action[3] = 0.6  # heater
-            action_reasons.append(f"Low temperature ({temp:.2f}°C < 16°C)")
-        
-        if not action_reasons:
-            action_reasons.append("No action needed (all conditions normal)")
+        # Determine action - use trained model if available, else naive policy
+        if model:
+            # Use trained PPO model
+            action, _ = model.predict(obs, deterministic=True)
+            action = action.tolist() if hasattr(action, 'tolist') else list(action)
+            action_reasons = [f"PPO model decision (deterministic)"]
+            logger.info("Using trained PPO model for action selection")
+        else:
+            # Fallback to naive policy
+            action = [0.0, 0.0, 0.0, 0.0]  # water, fan, shield_delta, heater
+            action_reasons = []
+            
+            if moist < 0.35:
+                action[0] = 0.8  # water
+                action_reasons.append(f"Low moisture ({moist:.3f} < 0.35)")
+            if temp > 28.0:
+                action[1] = 1.0  # fan on
+                action[2] = 0.2  # open shield slightly
+                action_reasons.append(f"High temperature ({temp:.2f}°C > 28°C)")
+            if temp < 16.0:
+                action[3] = 0.6  # heater
+                action_reasons.append(f"Low temperature ({temp:.2f}°C < 16°C)")
+            
+            if not action_reasons:
+                action_reasons.append("No action needed (all conditions normal)")
         
         # Log action
         logger.info("Action Selected:")
@@ -204,6 +333,19 @@ def sim_run(args):
             if diag:
                 logger.info(f"  Transpiration: {diag.get('transp_total_liters', 0):.4f} L/h")
                 logger.info(f"  VPD (normalized): {diag.get('vpd_norm', 0):.4f}")
+            
+            # Log soil status after step
+            if hasattr(env.plant.plant, 'soil'):
+                soil = env.plant.plant.soil
+                soil_status = soil.status()
+                logger.info("Soil Status After Step:")
+                logger.info(f"  pH: {soil_status.get('pH', 0):.2f}")
+                logger.info(f"  EC proxy: {soil_status.get('ec', 0):.3f}")
+                logger.info(f"  Macronutrients: N={soil_status.get('soil_N', 0):.4f}, P={soil_status.get('soil_P', 0):.4f}, K={soil_status.get('soil_K', 0):.4f}")
+                # Check for toxicity warnings
+                tox_warnings = soil.toxicity_warnings()
+                if tox_warnings:
+                    logger.warning(f"  Toxicity warnings: {tox_warnings}")
         if plant_info:
             logger.info(f"  Plant info: {plant_info}")
         
@@ -229,7 +371,10 @@ def sim_run(args):
             logger.info(f"  HW info: {hw_info}")
         
         # Log new observation
-        new_canopy, new_moist, new_nut, new_pmold, new_tmp_scaled, new_lux, new_shield_pos = obs
+        if len(obs) >= 7:
+            new_canopy, new_moist, new_nut, new_pmold, new_tmp_scaled, new_lux, new_shield_pos = obs[:7]
+        else:
+            new_canopy, new_moist, new_nut, new_pmold, new_tmp_scaled, new_lux, new_shield_pos = obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6] if len(obs) > 6 else 0.0
         new_temp = new_tmp_scaled * 40.0
         logger.info("New Observation:")
         logger.info(f"  Canopy: {new_canopy:.4f} (Δ{new_canopy-canopy:+.4f})")
@@ -268,10 +413,30 @@ def sim_run(args):
         logger.info(f"  Final leaf biomass: {np.sum(env.plant.plant.B_leaf):.4f} g")
         logger.info(f"  Final root biomass: {np.sum(env.plant.plant.B_root):.4f} g")
         logger.info(f"  Final stem biomass: {np.sum(env.plant.plant.B_stem):.4f} g")
+        
+        # Final soil status
+        if hasattr(env.plant.plant, 'soil'):
+            soil = env.plant.plant.soil
+            soil_status = soil.status()
+            logger.info("\nFinal Soil Status:")
+            logger.info(f"  pH: {soil_status.get('pH', 0):.2f}")
+            logger.info(f"  EC proxy: {soil_status.get('ec', 0):.3f}")
+            logger.info(f"  Macronutrients:")
+            logger.info(f"    N: {soil_status.get('soil_N', 0):.4f}")
+            logger.info(f"    P: {soil_status.get('soil_P', 0):.4f}")
+            logger.info(f"    K: {soil_status.get('soil_K', 0):.4f}")
+            logger.info(f"  Micronutrients:")
+            for micro in ['Fe', 'Mn', 'Zn', 'Cu', 'B', 'Mo', 'Se', 'Cl']:
+                if f'soil_{micro}' in soil_status:
+                    logger.info(f"    {micro}: {soil_status[f'soil_{micro}']:.4f}")
+            # Final toxicity check
+            tox_warnings = soil.toxicity_warnings()
+            if tox_warnings:
+                logger.warning(f"  Final toxicity warnings: {tox_warnings}")
     logger.info("\nFinal Environment State:")
     logger.info(f"  Temperature: {env.env.T:.2f}°C")
     logger.info(f"  Relative Humidity: {env.env.RH:.2f}%")
-    logger.info("\nFinal Hardware State:")
+    logger.info(f"\nFinal Hardware State:")
     logger.info(f"  Shield position: {env.hw.shield_pos:.4f}")
     logger.info(f"  Fan on: {env.hw.fan_on}")
     logger.info(f"  Total energy consumed: {env.hw.energy:.4f}")
@@ -280,6 +445,9 @@ def sim_run(args):
     
     print(f"[main] Sim finished. Total reward: {total_reward:.4f}")
     print(f"[main] Detailed log saved to: {log_file}")
+    if model:
+        print(f"[main] Used trained PPO model: {model_path}")
+
 
 def sample_visual(args):
     out = args.out or "sample_visual.png"
@@ -322,8 +490,23 @@ def parse_args():
     tc.add_argument("--data", type=str, help="data directory (ImageFolder layout)")
     tc.add_argument("--epochs", type=int, help="epochs")
 
-    s = sub.add_parser("sim_run", help="Run a short simulation with heuristic policy")
+    s = sub.add_parser("sim_run", help="Run a simulation (uses trained PPO model if available, else naive policy)")
     s.add_argument("--steps", type=int, help="timesteps to run")
+    s.add_argument("--model", type=str, default=None, help="Path to trained PPO model (default: auto-detect best)")
+    s.add_argument("--use_extended_obs", action='store_true', help="Use extended observations (if model was trained with them)")
+    s.add_argument("--dose_nutrients", action='store_true', help="Apply nutrient dose at start (N=0.1, P=0.05, K=0.1)")
+    s.add_argument("--dose_N", type=float, default=None, help="Nitrogen dose (0..1)")
+    s.add_argument("--dose_P", type=float, default=None, help="Phosphorus dose (0..1)")
+    s.add_argument("--dose_K", type=float, default=None, help="Potassium dose (0..1)")
+    s.add_argument("--no_model", action='store_true', help="Do not use a trained model")
+
+    v=sub.add_parser("analyze_sim_logs", help="Analyze simulation logs")
+    v.add_argument("--log_file", type=str, default=None, help="path to log file")
+    v.add_argument("--out_dir", type=str, default="viz_output", help="output directory")
+    v.add_argument("--plot_dir", type=str, default="viz_output/plots", help="plot directory")
+    v.add_argument("--csv_out", type=str, default="viz_output/parsed_sim.csv", help="csv output file")
+    v.add_argument("--summary_out", type=str, default="viz_output/summary.txt", help="summary output file")
+    v.add_argument("--dash_out", type=str, default="viz_output/dashboard.html", help="dashboard output file")
 
     sv = sub.add_parser("sample_visual", help="Generate sample visual and optionally composite with real image")
     sv.add_argument("--out", type=str, help="output filename")
@@ -344,6 +527,8 @@ def main():
         train_classifier_cmd(args)
     elif args.cmd == "sim_run":
         sim_run(args)
+    elif args.cmd == "analyze_sim_logs":
+        analyze_sim_logs(args.log_file)
     elif args.cmd == "sample_visual":
         sample_visual(args)
     else:

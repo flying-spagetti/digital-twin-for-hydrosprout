@@ -20,6 +20,35 @@ pump_latency_steps: 1
 fan_cooling_rate: 0.05
 shield_light_factor: 0.4
 reward:
-w_c: 1.0
-w_m: 5.0
-w_e: 0.1
+  # Base rewards (balanced to prevent collapse)
+  w_c: 1.0  # Canopy weight (reduced from 2.0)
+  w_m: 3.0  # Mold penalty weight (reduced from 5.0)
+  w_e: 0.005  # Energy cost weight (reduced)
+  
+  # Range rewards (new - encourage optimal conditions)
+  w_moist_range: 2.0  # Moisture range reward (bell curve around optimal)
+  w_temp_range: 2.0  # Temperature range reward (bell curve around optimal)
+  
+  # Death penalty (large negative to strongly discourage)
+  w_death: -50.0  # Plant death penalty
+  
+  # Growth rewards
+  w_biomass: 0.3  # Biomass growth weight
+  w_LAI: 0.2  # LAI weight (reduced from 0.3)
+  
+  # Soil health
+  w_soil: 0.1  # Soil health weight
+  w_ph: 0.05  # pH optimality weight (reduced from 0.1)
+
+ppo:
+  # Hyperparameters optimized to avoid collapse
+  learning_rate: 1e-4  # Reduced from 3e-4 for stability
+  n_steps: 2048  # Steps per update
+  batch_size: 64
+  n_epochs: 10  # Optimization epochs per update
+  gamma: 0.995  # Slightly higher discount
+  gae_lambda: 0.95
+  clip_range: 0.2  # PPO clip range
+  ent_coef: 0.02  # Increased from 0.01 for better exploration
+  vf_coef: 0.5  # Value function coefficient
+  max_grad_norm: 0.5  # Gradient clipping
