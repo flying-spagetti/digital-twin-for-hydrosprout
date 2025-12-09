@@ -1,6 +1,7 @@
 # rl/train_ppo.py
 """
 Train PPO agent on the DigitalTwinEnv with PlantStructural model.
+Tweaked for higher exploration to prevent "passive agent" failure.
 """
 
 import argparse
@@ -53,18 +54,18 @@ def create_env(cfg=None, use_extended_obs=False, include_soil_obs=False,
     if include_nutrient_actions:
         cfg['include_nutrient_actions'] = True
     
+    # 1. Create Base Env (or Wrapped Env)
     if use_wrappers:
-        # Use our custom wrapper factory
+        # make_env applies Clip, Normalize, ScaleReward, etc.
         env = make_env(cfg=cfg, use_wrappers=True, use_framestack=False)
     else:
-        # Raw env
         env = DigitalTwinEnv(cfg=cfg)
         env = Monitor(env)
     
-    # Apply curriculum wrapper if requested
+    # 2. Apply Curriculum Wrapper (Outer Layer)
     if use_curriculum and curriculum is not None:
         env = CurriculumWrapper(env, curriculum)
-    
+        
     return env
 
 def main(args):
@@ -88,14 +89,15 @@ def main(args):
     use_curriculum = getattr(args, 'use_curriculum', False)
     use_wrappers = getattr(args, 'use_wrappers', True)
     
-    # Setup curriculum learning if requested
+    # Setup curriculum learning
     curriculum = None
     if use_curriculum:
-        # Ensure total_timesteps is set for curriculum scaling
+        # Total timesteps is critical for calculating curriculum stages
         curriculum = CurriculumScheduler(total_timesteps=args.timesteps)
-        print(f"Curriculum learning enabled with {len(curriculum.stages)} stages")
+        print(f"Curriculum learning enabled: {len(curriculum.stages)} stages defined.")
+        print(f"Initial Stage: {curriculum.current_stage}")
     
-    # Create environment
+    # Create training environment
     env = create_env(
         cfg=cfg, 
         use_extended_obs=args.extended,
@@ -106,13 +108,13 @@ def main(args):
         curriculum=curriculum
     )
     
-    # Create evaluation environment (no curriculum for consistent metric comparison)
+    # Create evaluation environment (No curriculum wrapper for consistent benchmarks)
     eval_env = create_env(
         cfg=cfg, 
         use_extended_obs=args.extended,
         include_soil_obs=include_soil_obs,
         include_nutrient_actions=include_nutrient_actions,
-        use_wrappers=False,  # No wrappers for evaluation usually
+        use_wrappers=False,  # Raw env for true performance eval
         use_curriculum=False 
     )
     eval_env = Monitor(eval_env)
@@ -120,11 +122,10 @@ def main(args):
     # Setup callbacks
     callbacks = []
     
-    # Curriculum callback
     if use_curriculum and curriculum is not None:
         callbacks.append(CurriculumCallback(curriculum))
     
-    # Evaluation callback
+    # Evaluate occasionally to check progress
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path='./ppo_best/',
@@ -135,7 +136,6 @@ def main(args):
     )
     callbacks.append(eval_callback)
     
-    # Checkpoint callback
     checkpoint_callback = CheckpointCallback(
         save_freq=max(5000, args.timesteps // 10),
         save_path='./ppo_checkpoints/',
@@ -145,9 +145,10 @@ def main(args):
     
     callback = CallbackList(callbacks) if len(callbacks) > 0 else None
     
-    # Hyperparameters - Tuned for stability
+    # --- PPO HYPERPARAMETERS (TUNED) ---
     def constant_lr_schedule(progress_remaining):
-        return 1e-4
+        # Increased to 3e-4 to speed up initial learning
+        return 3e-4
 
     ppo_kwargs = {
         'policy': 'MlpPolicy',
@@ -160,67 +161,63 @@ def main(args):
         'gamma': 0.995,
         'gae_lambda': 0.95,
         'clip_range': 0.2,
-        'ent_coef': 0.02, # Enforce exploration
+        # Increased entropy to force agent to try actions (Fan/Water) instead of doing nothing
+        'ent_coef': 0.05, 
         'vf_coef': 0.5,
         'max_grad_norm': 0.5,
         'tensorboard_log': './ppo_tensorboard/',
+        'device': 'auto', # Use GPU if available
         'policy_kwargs': {
             'net_arch': dict(pi=[256, 256], vf=[256, 256]),
             'activation_fn': nn.Tanh,
         },
     }
     
-    # Override with config if available
+    # Allow config file to override specific PPO params
     if cfg and 'ppo' in cfg and cfg['ppo']:
-        ppo_config = cfg['ppo'].copy() if isinstance(cfg['ppo'], dict) else {}
-        
-        # Handle learning_rate separately - must be callable
+        ppo_config = cfg['ppo']
+        # Remove LR from config if we want to enforce our schedule, 
+        # or add logic here to use config's LR.
+        # For now, we trust the hardcoded schedule for stability.
         if 'learning_rate' in ppo_config:
-            lr_val = float(ppo_config['learning_rate'])
-            def config_lr_schedule(progress_remaining):
-                return lr_val
-            ppo_kwargs['learning_rate'] = config_lr_schedule
-            del ppo_config['learning_rate']  # Remove to avoid overwrite
-        
-        # Update other parameters
+            del ppo_config['learning_rate']
         ppo_kwargs.update(ppo_config)
-    
-    # Final safety check: ensure learning_rate is always callable
-    if not callable(ppo_kwargs.get('learning_rate')):
-        lr_val = float(ppo_kwargs.get('learning_rate', 1e-4))
-        def final_lr_schedule(progress_remaining):
-            return lr_val
-        ppo_kwargs['learning_rate'] = final_lr_schedule
     
     # Train
     if args.demo:
-        print("Running quick PPO demo...")
+        print("Running quick PPO demo training...")
         ppo_kwargs['n_steps'] = 512
         ppo_kwargs['batch_size'] = 32
         model = PPO(**ppo_kwargs)
         model.learn(total_timesteps=args.timesteps, callback=callback)
         model.save('ppo_demo')
+        print("Demo complete.")
     else:
-        print("Running full PPO training...")
+        print(f"Starting full PPO training for {args.timesteps} timesteps...")
         model = PPO(**ppo_kwargs)
         model.learn(total_timesteps=args.timesteps, callback=callback)
         model.save('ppo_full')
+        print("Training complete.")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--demo', action='store_true', help='Run quick demo')
+    parser = argparse.ArgumentParser(description='Train PPO on DigitalTwin')
+    parser.add_argument('--demo', action='store_true', help='Run quick 2k step demo')
     parser.add_argument('--extended', action='store_true', help='Use extended observations')
     parser.add_argument('--include_soil_obs', action='store_true', help='Include soil metrics')
-    parser.add_argument('--include_nutrient_actions', action='store_true', help='Include nutrient actions')
-    parser.add_argument('--config', type=str, default=None, help='Path to config')
-    parser.add_argument('--timesteps', type=int, default=None, help='Training timesteps')
-    parser.add_argument('--use_curriculum', action='store_true', help='Enable curriculum')
-    parser.add_argument('--no_wrappers', action='store_true', help='Disable wrappers')
+    parser.add_argument('--include_nutrient_actions', action='store_true', help='Enable nutrient dosing')
+    parser.add_argument('--config', type=str, default=None, help='Config file path')
+    parser.add_argument('--timesteps', type=int, default=None, help='Total training timesteps')
+    parser.add_argument('--use_curriculum', action='store_true', help='Enable curriculum learning')
+    parser.add_argument('--no_wrappers', action='store_true', help='Disable standard wrappers')
+    
     args = parser.parse_args()
     
+    # Default timesteps if not provided
     if args.timesteps is None:
-        args.timesteps = 2000 if args.demo else 300000 # Default increased to support curriculum
+        # 300k is a good baseline for this curriculum (allows ~30k steps per stage transition)
+        args.timesteps = 2000 if args.demo else 300000 
     
+    # Logic inversion for clarity
     args.use_wrappers = not args.no_wrappers
     
     main(args)

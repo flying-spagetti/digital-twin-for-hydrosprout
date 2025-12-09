@@ -9,3 +9,10 @@
 /tmp_sample/
 /sample_vis.png
 /logs/
+/ppo_best/
+/ppo_checkpoints/
+/ppo_logs/
+/ppo_tensorboard/
+/ppo_full_zip/
+ppo_best/best_model.zip
+ppo_full.zip

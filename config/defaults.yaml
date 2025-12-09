@@ -23,7 +23,7 @@ reward:
   # Base rewards (balanced to prevent collapse)
   w_c: 1.0  # Canopy weight (reduced from 2.0)
   w_m: 3.0  # Mold penalty weight (reduced from 5.0)
-  w_e: 0.005  # Energy cost weight (reduced)
+  w_e: 0.000  # Energy cost weight (reduced)
   
   # Range rewards (new - encourage optimal conditions)
   w_moist_range: 2.0  # Moisture range reward (bell curve around optimal)
