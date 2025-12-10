@@ -17,9 +17,11 @@ sys.path.insert(0, str(ROOT))
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList, BaseCallback
 from stable_baselines3.common.monitor import Monitor
-from rl.gym_env import DigitalTwinEnv
+from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
 from rl.wrappers import make_env
 from rl.curriculum import CurriculumScheduler, CurriculumWrapper
+from rl.diagnostics import TrainingDiagnostics
+import numpy as np
 
 # Try to load config if available
 try:
@@ -40,6 +42,100 @@ class CurriculumCallback(BaseCallback):
         """Update curriculum based on current timesteps."""
         self.curriculum.update(self.num_timesteps)
         return True
+
+
+class DiagnosticsCallback(BaseCallback):
+    """Callback to track training diagnostics and generate visualizations."""
+    
+    def __init__(self, diagnostics: TrainingDiagnostics, log_freq: int = 100, verbose=0):
+        super().__init__(verbose)
+        self.diagnostics = diagnostics
+        self.log_freq = log_freq  # Log plots every N episodes
+        
+        # Episode tracking
+        self.current_episode_actions = []
+        self.current_episode_info = None
+    
+    def _on_step(self) -> bool:
+        """Log step-level data and track episode actions."""
+        # Get info from the environment (stable-baselines3 structure)
+        infos = self.locals.get('infos', [])
+        if not infos:
+            return True
+        
+        # Handle both single info and list of infos
+        info = infos[0] if isinstance(infos, list) else infos
+        
+        # Track actions for this episode
+        actions = self.locals.get('actions', None)
+        if actions is not None:
+            # Handle both single action and batch of actions
+            if isinstance(actions, (list, np.ndarray)) and len(actions) > 0:
+                action = actions[0] if isinstance(actions, (list, np.ndarray)) and len(actions.shape) > 1 else actions
+                if isinstance(action, np.ndarray):
+                    self.current_episode_actions.append(action.copy())
+                else:
+                    self.current_episode_actions.append(action)
+        
+        # Log step-level data if available
+        if isinstance(info, dict) and 'plant' in info and 'env' in info:
+            try:
+                self.diagnostics.log_step(info['plant'], info['env'])
+            except Exception as e:
+                if self.verbose > 1:
+                    print(f"[Diagnostics] Warning: Could not log step: {e}")
+        
+        # Check if episode ended (stable-baselines3 adds 'episode' key when done)
+        if isinstance(info, dict) and 'episode' in info:
+            # Episode completed - log it
+            episode_info = info['episode']
+            
+            # Build info dict for diagnostics
+            diagnostics_info = {
+                'episode_reward': episode_info.get('r', 0),
+                'episode_length': episode_info.get('l', 0),
+                'death_reason': episode_info.get('death_reason', None),
+            }
+            
+            # Get cumulative stats from the current step's info
+            if 'cumulative_growth' in info:
+                diagnostics_info['cumulative_growth'] = info['cumulative_growth']
+            if 'cumulative_water_used' in info:
+                diagnostics_info['cumulative_water_used'] = info['cumulative_water_used']
+            else:
+                # Fallback: set to 0 if not available
+                diagnostics_info['cumulative_water_used'] = 0
+            
+            # Log the episode
+            try:
+                self.diagnostics.log_episode(diagnostics_info, self.current_episode_actions)
+            except Exception as e:
+                if self.verbose > 0:
+                    print(f"[Diagnostics] Warning: Could not log episode: {e}")
+            
+            # Reset episode tracking
+            self.current_episode_actions = []
+            
+            # Periodically generate plots
+            num_episodes = len(self.diagnostics.episode_rewards)
+            if num_episodes > 0 and num_episodes % self.log_freq == 0:
+                if self.verbose > 0:
+                    print(f"\n[Diagnostics] Generating plots at episode {num_episodes}...")
+                try:
+                    self.diagnostics.plot_training_progress()
+                    self.diagnostics.save_summary()
+                except Exception as e:
+                    if self.verbose > 0:
+                        print(f"[Diagnostics] Warning: Could not generate plots: {e}")
+        
+        return True
+    
+    def _on_training_end(self) -> None:
+        """Generate final plots and summary when training ends."""
+        if self.verbose > 0:
+            print("\n[Diagnostics] Generating final training plots...")
+        self.diagnostics.plot_training_progress()
+        self.diagnostics.save_summary()
 
 def create_env(cfg=None, use_extended_obs=False, include_soil_obs=False, 
                include_nutrient_actions=False, use_wrappers=True, 
@@ -119,11 +215,23 @@ def main(args):
     )
     eval_env = Monitor(eval_env)
     
+    # Setup diagnostics
+    log_dir = args.log_dir if hasattr(args, 'log_dir') and args.log_dir else './training_logs'
+    diagnostics = TrainingDiagnostics(log_dir=log_dir)
+    
     # Setup callbacks
     callbacks = []
     
     if use_curriculum and curriculum is not None:
         callbacks.append(CurriculumCallback(curriculum))
+    
+    # Diagnostics callback (log plots every 100 episodes)
+    diagnostics_callback = DiagnosticsCallback(
+        diagnostics=diagnostics,
+        log_freq=100,
+        verbose=1
+    )
+    callbacks.append(diagnostics_callback)
     
     # Evaluate occasionally to check progress
     eval_callback = EvalCallback(
@@ -161,8 +269,8 @@ def main(args):
         'gamma': 0.995,
         'gae_lambda': 0.95,
         'clip_range': 0.2,
-        # Increased entropy to force agent to try actions (Fan/Water) instead of doing nothing
-        'ent_coef': 0.05, 
+        # FIXED: Proper entropy for control tasks (was 0.05, now 0.005) (Fan/Water) instead of doing nothing
+        'ent_coef': 0.005,  # FIXED: Reduced from 0.05 (was 10x too high) 
         'vf_coef': 0.5,
         'max_grad_norm': 0.5,
         'tensorboard_log': './ppo_tensorboard/',
@@ -209,6 +317,7 @@ if __name__ == '__main__':
     parser.add_argument('--timesteps', type=int, default=None, help='Total training timesteps')
     parser.add_argument('--use_curriculum', action='store_true', help='Enable curriculum learning')
     parser.add_argument('--no_wrappers', action='store_true', help='Disable standard wrappers')
+    parser.add_argument('--log_dir', type=str, default='./training_logs', help='Directory for training logs and diagnostics')
     
     args = parser.parse_args()
     

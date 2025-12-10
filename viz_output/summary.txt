@@ -1,18 +1,18 @@
 Simulation analysis summary
-Generated: 2025-12-09 22:13:50.689622
+Generated: 2025-12-10 18:12:15.580289
 
-Rows parsed: 337
+Rows parsed: 49
 
 Key metrics (min / mean / max):
-  canopy: 0.1201 / 0.2138 / 0.2218
-  moisture: 0.3500 / 0.4578 / 0.4717
-  nutrient: 0.0004 / 0.0338 / 0.5350
-  mold_prob: 0.0000 / 0.0002 / 0.0069
-  temp_c: 25.9400 / 30.6303 / 32.8400
-  lux: 0.0000 / 0.1478 / 0.8438
-  shield_pos: 0.0000 / 0.9381 / 1.0000
-  energy: 0.2146 / 36.0658 / 71.8974
+  canopy: 0.0022 / 0.0024 / 0.0026
+  moisture: 0.4967 / 0.5176 / 0.5373
+  nutrient: 0.7421 / 0.7478 / 1.0000
+  mold_prob: 0.0022 / 0.0024 / 0.0026
+  temp_c: 23.0700 / 24.5678 / 26.0700
+  lux: 0.0000 / 0.4426 / 1.0000
+  shield_pos: 0.0000 / 0.0000 / 0.0000
+  energy: 0.2031 / 5.0970 / 9.9553
 
-Peak canopy at step 336 value=0.2218
+Peak canopy at step 36 value=0.0026
 
 End of summary

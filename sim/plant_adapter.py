@@ -7,7 +7,7 @@ in the gym_env and main.py.
 """
 
 import numpy as np
-from sim.plant_SFPM import PlantStructural
+from sim.plant_SFPM import HydroponicPlantFSPM as PlantStructural
 
 
 class PlantStructuralAdapter:

@@ -121,7 +121,7 @@ class FrameStack(gym.ObservationWrapper):
 
 def make_env(cfg=None, use_wrappers=True, use_framestack=False, n_frames=4):
     """Factory function to create and wrap environment."""
-    from rl.gym_env import DigitalTwinEnv
+    from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
     
     env = DigitalTwinEnv(cfg=cfg)
     

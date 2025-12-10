@@ -32,7 +32,8 @@ sys.path.insert(0, str(ROOT))
 from visionmodel import synth_generator
 from rl.train_ppo import main as ppo_main
 from visionmodel import train_classifier
-from rl.gym_env import DigitalTwinEnv
+from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
+from config import get_species_config
 
 # Default uploaded image path from session (you can change this)
 DEFAULT_REAL_IMAGE = "/mnt/data/A_high-resolution_digital_photograph_showcases_an_.png"
@@ -61,6 +62,47 @@ def train_classifier_cmd(args):
 def sim_run(args):
     steps = args.steps or 48
     
+    # Load species configuration if specified
+    env_cfg = {}
+    if hasattr(args, 'species') and args.species:
+        try:
+            species_cfg = get_species_config(args.species)
+            print(f"[main] Loading species: {args.species}")
+            print(f"[main] Description: {species_cfg.get('description', 'N/A')}")
+            
+            # Convert species config to plant parameters format
+            # Map species_config.yaml parameters to PlantParameters
+            plant_params = {}
+            
+            # SLA: convert from cm²/g to m²/g
+            if 'SLA_cm2_per_g' in species_cfg:
+                plant_params['SLA'] = species_cfg['SLA_cm2_per_g'] / 10000.0  # cm² to m²
+            
+            # Allocation ratios -> partition coefficients
+            if 'alloc_leaf' in species_cfg:
+                plant_params['partition_leaf_early'] = species_cfg['alloc_leaf']
+                plant_params['partition_leaf_late'] = species_cfg['alloc_leaf'] * 0.5  # Reduce in late stage
+            if 'alloc_stem' in species_cfg:
+                plant_params['partition_stem_early'] = species_cfg['alloc_stem']
+                plant_params['partition_stem_late'] = species_cfg['alloc_stem'] * 1.5  # Increase in late stage
+            if 'alloc_root' in species_cfg:
+                plant_params['partition_root_early'] = species_cfg['alloc_root']
+                plant_params['partition_root_late'] = species_cfg['alloc_root'] * 0.7  # Reduce in late stage
+            
+            # A_max -> RGR_max (approximate mapping)
+            if 'A_max' in species_cfg:
+                plant_params['RGR_max'] = species_cfg['A_max'] * 6.0  # Scale to reasonable RGR
+            
+            # Nutrient demand -> N_uptake_rate (approximate)
+            if 'nutrient_demand' in species_cfg and 'N' in species_cfg['nutrient_demand']:
+                plant_params['N_uptake_rate'] = species_cfg['nutrient_demand']['N'] * 0.04
+            
+            env_cfg['plant'] = {'species_params': plant_params}
+            
+        except Exception as e:
+            print(f"[main] Warning: Could not load species config: {e}")
+            print(f"[main] Using default plant parameters")
+    
     # Prepare nutrient dose if specified
     nutrient_dose = None
     if hasattr(args, 'dose_nutrients') and (args.dose_nutrients or args.dose_N is not None or args.dose_P is not None or args.dose_K is not None):
@@ -88,18 +130,15 @@ def sim_run(args):
             if best_model.exists():
                 model_path = str(best_model)
     
-    env = DigitalTwinEnv()
+    env = DigitalTwinEnv(cfg=env_cfg)
     
-    # Apply initial nutrient dose if provided
-    if nutrient_dose and hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'soil'):
-        env.plant.plant.soil.add_dose(
-            N=nutrient_dose['N'],
-            P=nutrient_dose['P'],
-            K=nutrient_dose['K'],
-            micro=nutrient_dose.get('micro'),
-            chelated=nutrient_dose.get('chelated', False)
-        )
-        print(f"[main] Applied initial nutrient dose: N={nutrient_dose['N']:.3f}, P={nutrient_dose['P']:.3f}, K={nutrient_dose['K']:.3f}")
+    # Apply initial nutrient dose if provided (HydroponicPlantFSPM uses solution_N directly)
+    if nutrient_dose:
+        # For HydroponicPlantFSPM, we can set solution_N directly (normalized 0-1)
+        # Weighted average of N, P, K
+        combined_nutrient = 0.5 * nutrient_dose['N'] + 0.3 * nutrient_dose['P'] + 0.2 * nutrient_dose['K']
+        env.plant.solution_N = min(1.0, max(0.0, combined_nutrient))
+        print(f"[main] Applied initial nutrient dose: N={nutrient_dose['N']:.3f}, P={nutrient_dose['P']:.3f}, K={nutrient_dose['K']:.3f} (combined={combined_nutrient:.3f})")
     
     # If model path found, try to load it
     if model_path and Path(model_path).exists():
@@ -119,23 +158,17 @@ def sim_run(args):
                     use_extended = True
                     print(f"[main] Model was trained with extended observations, enabling extended mode")
                 
-                # Create environment with matching observation space
-                env_cfg = {}
+                # Preserve existing env_cfg (including species config) and add extended obs flag
                 if use_extended:
                     env_cfg['use_extended_obs'] = True
                 
-                # Recreate env with correct config
+                # Recreate env with correct config (species config is already in env_cfg)
                 env = DigitalTwinEnv(cfg=env_cfg)
                 
                 # Re-apply nutrient dose if env was recreated
-                if nutrient_dose and hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'soil'):
-                    env.plant.plant.soil.add_dose(
-                        N=nutrient_dose['N'],
-                        P=nutrient_dose['P'],
-                        K=nutrient_dose['K'],
-                        micro=nutrient_dose.get('micro'),
-                        chelated=nutrient_dose.get('chelated', False)
-                    )
+                if nutrient_dose:
+                    combined_nutrient = 0.5 * nutrient_dose['N'] + 0.3 * nutrient_dose['P'] + 0.2 * nutrient_dose['K']
+                    env.plant.solution_N = min(1.0, max(0.0, combined_nutrient))
                 
                 # Now load model with correct environment
                 model = PPO.load(model_path, env=env)
@@ -205,33 +238,17 @@ def sim_run(args):
     
     # Log initial plant state
     logger.info("Initial Plant State:")
-    logger.info(f"  Canopy (C): {env.plant.C:.4f}")
-    logger.info(f"  Moisture (M): {env.plant.M:.4f}")
-    logger.info(f"  Nutrient (N): {env.plant.N:.4f}")
-    logger.info(f"  Mold probability (P_mold): {env.plant.P_mold:.4f}")
-    # PlantStructural-specific details
-    if hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'LAI'):
-        logger.info(f"  LAI (Leaf Area Index): {env.plant.plant.LAI:.4f}")
-        logger.info(f"  Total leaf biomass: {np.sum(env.plant.plant.B_leaf):.4f} g")
-        logger.info(f"  Total root biomass: {np.sum(env.plant.plant.B_root):.4f} g")
-        logger.info(f"  Total stem biomass: {np.sum(env.plant.plant.B_stem):.4f} g")
-        logger.info(f"  Number of plants: {env.plant.plant.n}")
-        
-        # Log soil status if SoilModelExtended is available
-        if hasattr(env.plant.plant, 'soil'):
-            soil = env.plant.plant.soil
-            soil_status = soil.status()
-            logger.info("Initial Soil Status:")
-            logger.info(f"  pH: {soil_status.get('pH', 0):.2f}")
-            logger.info(f"  EC proxy: {soil_status.get('ec', 0):.3f}")
-            logger.info(f"  Macronutrients:")
-            logger.info(f"    N: {soil_status.get('soil_N', 0):.4f}")
-            logger.info(f"    P: {soil_status.get('soil_P', 0):.4f}")
-            logger.info(f"    K: {soil_status.get('soil_K', 0):.4f}")
-            logger.info(f"  Micronutrients:")
-            for micro in ['Fe', 'Mn', 'Zn', 'Cu', 'B', 'Mo']:
-                if f'soil_{micro}' in soil_status:
-                    logger.info(f"    {micro}: {soil_status[f'soil_{micro}']:.4f}")
+    plant_state = env.plant.get_state()
+    logger.info(f"  Canopy: {plant_state.get('canopy', 0):.4f}")
+    logger.info(f"  Moisture: {plant_state.get('moisture', 0):.4f}")
+    logger.info(f"  Nutrient: {plant_state.get('nutrient', 0):.4f}")
+    logger.info(f"  LAI (Leaf Area Index): {plant_state.get('LAI', 0):.4f}")
+    logger.info(f"  Total leaf biomass: {np.sum(env.plant.organs.B_leaf):.4f} g")
+    logger.info(f"  Total root biomass: {np.sum(env.plant.organs.B_root):.4f} g")
+    logger.info(f"  Total stem biomass: {np.sum(env.plant.organs.B_stem):.4f} g")
+    logger.info(f"  Water stress: {plant_state.get('stress_water', 1.0):.4f}")
+    logger.info(f"  Temperature stress: {plant_state.get('stress_temp', 1.0):.4f}")
+    logger.info(f"  Nutrient stress: {plant_state.get('stress_nutrient', 1.0):.4f}")
     
     # Log initial environment state
     logger.info("Initial Environment State:")
@@ -318,34 +335,18 @@ def sim_run(args):
         
         # Log plant state from info
         plant_info = info.get('plant', {})
+        plant_state = env.plant.get_state()
         logger.info("Plant State After Step:")
-        logger.info(f"  Canopy (C): {env.plant.C:.4f}")
-        logger.info(f"  Moisture (M): {env.plant.M:.4f}")
-        logger.info(f"  Nutrient (N): {env.plant.N:.4f}")
-        logger.info(f"  Mold probability (P_mold): {env.plant.P_mold:.4f}")
-        # PlantStructural-specific details
-        if hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'LAI'):
-            logger.info(f"  LAI (Leaf Area Index): {env.plant.plant.LAI:.4f}")
-            logger.info(f"  Total leaf biomass: {np.sum(env.plant.plant.B_leaf):.4f} g")
-            logger.info(f"  Total root biomass: {np.sum(env.plant.plant.B_root):.4f} g")
-            logger.info(f"  Total stem biomass: {np.sum(env.plant.plant.B_stem):.4f} g")
-            diag = plant_info.get('diagnostics', {})
-            if diag:
-                logger.info(f"  Transpiration: {diag.get('transp_total_liters', 0):.4f} L/h")
-                logger.info(f"  VPD (normalized): {diag.get('vpd_norm', 0):.4f}")
-            
-            # Log soil status after step
-            if hasattr(env.plant.plant, 'soil'):
-                soil = env.plant.plant.soil
-                soil_status = soil.status()
-                logger.info("Soil Status After Step:")
-                logger.info(f"  pH: {soil_status.get('pH', 0):.2f}")
-                logger.info(f"  EC proxy: {soil_status.get('ec', 0):.3f}")
-                logger.info(f"  Macronutrients: N={soil_status.get('soil_N', 0):.4f}, P={soil_status.get('soil_P', 0):.4f}, K={soil_status.get('soil_K', 0):.4f}")
-                # Check for toxicity warnings
-                tox_warnings = soil.toxicity_warnings()
-                if tox_warnings:
-                    logger.warning(f"  Toxicity warnings: {tox_warnings}")
+        logger.info(f"  Canopy: {plant_state.get('canopy', 0):.4f}")
+        logger.info(f"  Moisture: {plant_state.get('moisture', 0):.4f}")
+        logger.info(f"  Nutrient: {plant_state.get('nutrient', 0):.4f}")
+        logger.info(f"  LAI (Leaf Area Index): {plant_state.get('LAI', 0):.4f}")
+        logger.info(f"  Total leaf biomass: {np.sum(env.plant.organs.B_leaf):.4f} g")
+        logger.info(f"  Total root biomass: {np.sum(env.plant.organs.B_root):.4f} g")
+        logger.info(f"  Total stem biomass: {np.sum(env.plant.organs.B_stem):.4f} g")
+        logger.info(f"  Water stress: {plant_state.get('stress_water', 1.0):.4f}")
+        logger.info(f"  Temperature stress: {plant_state.get('stress_temp', 1.0):.4f}")
+        logger.info(f"  Nutrient stress: {plant_state.get('stress_nutrient', 1.0):.4f}")
         if plant_info:
             logger.info(f"  Plant info: {plant_info}")
         
@@ -402,37 +403,19 @@ def sim_run(args):
     logger.info(f"Total reward: {total_reward:.4f}")
     logger.info(f"Average reward per step: {total_reward/(t+1):.4f}")
     logger.info("\nFinal Plant State:")
-    logger.info(f"  Canopy (C): {env.plant.C:.4f}")
-    logger.info(f"  Moisture (M): {env.plant.M:.4f}")
-    logger.info(f"  Nutrient (N): {env.plant.N:.4f}")
-    logger.info(f"  Mold probability (P_mold): {env.plant.P_mold:.4f}")
-    # PlantStructural-specific final details
-    if hasattr(env.plant, 'plant') and hasattr(env.plant.plant, 'LAI'):
-        logger.info(f"  Final LAI: {env.plant.plant.LAI:.4f}")
-        logger.info(f"  Final total biomass: {np.sum(env.plant.plant.B_leaf + env.plant.plant.B_root + env.plant.plant.B_stem):.4f} g")
-        logger.info(f"  Final leaf biomass: {np.sum(env.plant.plant.B_leaf):.4f} g")
-        logger.info(f"  Final root biomass: {np.sum(env.plant.plant.B_root):.4f} g")
-        logger.info(f"  Final stem biomass: {np.sum(env.plant.plant.B_stem):.4f} g")
-        
-        # Final soil status
-        if hasattr(env.plant.plant, 'soil'):
-            soil = env.plant.plant.soil
-            soil_status = soil.status()
-            logger.info("\nFinal Soil Status:")
-            logger.info(f"  pH: {soil_status.get('pH', 0):.2f}")
-            logger.info(f"  EC proxy: {soil_status.get('ec', 0):.3f}")
-            logger.info(f"  Macronutrients:")
-            logger.info(f"    N: {soil_status.get('soil_N', 0):.4f}")
-            logger.info(f"    P: {soil_status.get('soil_P', 0):.4f}")
-            logger.info(f"    K: {soil_status.get('soil_K', 0):.4f}")
-            logger.info(f"  Micronutrients:")
-            for micro in ['Fe', 'Mn', 'Zn', 'Cu', 'B', 'Mo', 'Se', 'Cl']:
-                if f'soil_{micro}' in soil_status:
-                    logger.info(f"    {micro}: {soil_status[f'soil_{micro}']:.4f}")
-            # Final toxicity check
-            tox_warnings = soil.toxicity_warnings()
-            if tox_warnings:
-                logger.warning(f"  Final toxicity warnings: {tox_warnings}")
+    plant_state = env.plant.get_state()
+    logger.info(f"  Canopy: {plant_state.get('canopy', 0):.4f}")
+    logger.info(f"  Moisture: {plant_state.get('moisture', 0):.4f}")
+    logger.info(f"  Nutrient: {plant_state.get('nutrient', 0):.4f}")
+    logger.info(f"  Final LAI: {plant_state.get('LAI', 0):.4f}")
+    total_biomass = np.sum(env.plant.organs.B_leaf) + np.sum(env.plant.organs.B_root) + np.sum(env.plant.organs.B_stem)
+    logger.info(f"  Final total biomass: {total_biomass:.4f} g")
+    logger.info(f"  Final leaf biomass: {np.sum(env.plant.organs.B_leaf):.4f} g")
+    logger.info(f"  Final root biomass: {np.sum(env.plant.organs.B_root):.4f} g")
+    logger.info(f"  Final stem biomass: {np.sum(env.plant.organs.B_stem):.4f} g")
+    logger.info(f"  Water stress: {plant_state.get('stress_water', 1.0):.4f}")
+    logger.info(f"  Temperature stress: {plant_state.get('stress_temp', 1.0):.4f}")
+    logger.info(f"  Nutrient stress: {plant_state.get('stress_nutrient', 1.0):.4f}")
     logger.info("\nFinal Environment State:")
     logger.info(f"  Temperature: {env.env.T:.2f}°C")
     logger.info(f"  Relative Humidity: {env.env.RH:.2f}%")
@@ -492,6 +475,7 @@ def parse_args():
 
     s = sub.add_parser("sim_run", help="Run a simulation (uses trained PPO model if available, else naive policy)")
     s.add_argument("--steps", type=int, help="timesteps to run")
+    s.add_argument("--species", type=str, default=None, help="Plant species (kale, broccoli, radish, etc.)")
     s.add_argument("--model", type=str, default=None, help="Path to trained PPO model (default: auto-detect best)")
     s.add_argument("--use_extended_obs", action='store_true', help="Use extended observations (if model was trained with them)")
     s.add_argument("--dose_nutrients", action='store_true', help="Apply nutrient dose at start (N=0.1, P=0.05, K=0.1)")

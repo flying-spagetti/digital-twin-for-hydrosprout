@@ -21,6 +21,7 @@ except Exception:
     torch = None
 
 DEFAULT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'config', 'defaults.yaml'))
+SPECIES_CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), 'config', 'species_config.yaml'))
 
 
 def load_config(path=None):
@@ -36,6 +37,23 @@ def load_config(path=None):
     if seed is not None:
         _set_seeds(seed)
     return cfg
+
+
+def load_species_config():
+    """Load species configuration from species_config.yaml"""
+    if not os.path.exists(SPECIES_CONFIG_PATH):
+        raise FileNotFoundError(f"Species config file not found: {SPECIES_CONFIG_PATH}")
+    with open(SPECIES_CONFIG_PATH, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def get_species_config(species_name):
+    """Get configuration for a specific species"""
+    species_configs = load_species_config()
+    if species_name not in species_configs:
+        available = ', '.join(species_configs.keys())
+        raise ValueError(f"Species '{species_name}' not found. Available species: {available}")
+    return species_configs[species_name]
 
 
 def get_default_config():

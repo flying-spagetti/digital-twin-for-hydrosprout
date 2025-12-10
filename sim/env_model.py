@@ -15,7 +15,7 @@ class EnvironmentModel:
 
         # Core environment params
         self.dt = cfg.get('dt', 1.0)  # timestep (hours)
-        self.ambient = cfg.get('ambient', 30.0)  # ambient temp (°C)
+        self.ambient = cfg.get('ambient', 23.0)  # ambient temp (°C)
         self.T = cfg.get('initial_T', 25.0)      # internal temperature (°C)
         self.C_air = cfg.get('C_air', 1.0)       # heat capacity constant
         self.U_loss = cfg.get('U_loss', 0.1)     # passive heat loss coeff
