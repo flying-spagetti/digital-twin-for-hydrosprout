@@ -380,9 +380,17 @@ class HydroponicPlantFSPM:
         transp = self.transpiration(temp, RH) * self.dt  # L
         
         # Update soil moisture
-        water_capacity = 5.0  # Liters (arbitrary container size)
-        self.soil_moisture += (water_input - transp - evaporation) / water_capacity
+        # Realistic water capacity: ~0.5-2L per plant for hydroponic system
+        # This ensures water changes moisture on realistic timescales (hours, not minutes)
+        water_capacity = 1.5  # Liters (realistic for small hydroponic container)
+        # Water input directly increases moisture, transpiration and evaporation decrease it
+        moisture_change = (water_input - transp - evaporation) / water_capacity
+        self.soil_moisture += moisture_change
         self.soil_moisture = np.clip(self.soil_moisture, 0.0, 1.0)
+        
+        # Ensure water stress is updated immediately after moisture change
+        # (This is already done in photosynthesis, but ensure it's current)
+        self.stress_factors['water'] = self._water_stress(self.soil_moisture)
         
         # === NUTRIENT BALANCE ===
         N_uptake = self.nutrient_uptake() * self.dt  # g

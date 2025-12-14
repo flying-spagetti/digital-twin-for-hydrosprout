@@ -32,7 +32,9 @@ sys.path.insert(0, str(ROOT))
 from visionmodel import synth_generator
 from rl.train_ppo import main as ppo_main
 from visionmodel import train_classifier
-from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
+from rl.gym_env import EnhancedDigitalTwinEnv as DigitalTwinEnv
+from rl.wrappers import FlattenDictAction
+from gymnasium import spaces
 from config import get_species_config
 
 # Default uploaded image path from session (you can change this)
@@ -60,7 +62,12 @@ def train_classifier_cmd(args):
     train_classifier.train(data_dir=data_dir, epochs=epochs)
     print("[main] Classifier training done.")
 def sim_run(args):
-    steps = args.steps or 48
+    # Handle --full_episode flag: run exactly env.max_steps
+    if hasattr(args, 'full_episode') and args.full_episode:
+        # Will set steps after env is created
+        steps = None
+    else:
+        steps = args.steps or 48
     
     # Load species configuration if specified
     env_cfg = {}
@@ -132,6 +139,12 @@ def sim_run(args):
     
     env = DigitalTwinEnv(cfg=env_cfg)
     
+    # If --full_episode flag is set, use env.max_steps
+    if hasattr(args, 'full_episode') and args.full_episode:
+        # Get unwrapped env now (before it's potentially wrapped)
+        temp_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+        steps = temp_unwrapped.max_steps
+    
     # Apply initial nutrient dose if provided (HydroponicPlantFSPM uses solution_N directly)
     if nutrient_dose:
         # For HydroponicPlantFSPM, we can set solution_N directly (normalized 0-1)
@@ -169,6 +182,14 @@ def sim_run(args):
                 if nutrient_dose:
                     combined_nutrient = 0.5 * nutrient_dose['N'] + 0.3 * nutrient_dose['P'] + 0.2 * nutrient_dose['K']
                     env.plant.solution_N = min(1.0, max(0.0, combined_nutrient))
+                
+                # FIXED: Wrap environment with FlattenDictAction if model expects Box action space
+                # The model was trained with FlattenDictAction wrapper, so we need to apply it here too
+                # Store reference to unwrapped env for attribute access
+                unwrapped_env = env
+                if isinstance(env.action_space, spaces.Dict):
+                    env = FlattenDictAction(env)
+                    print(f"[main] Wrapped environment with FlattenDictAction for model compatibility")
                 
                 # Now load model with correct environment
                 model = PPO.load(model_path, env=env)
@@ -214,113 +235,211 @@ def sim_run(args):
         logger.info(f"Initial nutrient dose: N={nutrient_dose['N']:.3f}, P={nutrient_dose['P']:.3f}, K={nutrient_dose['K']:.3f}")
     logger.info("="*80)
     
+    # Get unwrapped environment for attribute access (if wrapped)
+    # Use gymnasium's built-in unwrapped property
+    unwrapped_env = env.unwrapped
+    
     # Reset environment
     obs, info = env.reset()
     logger.info("Environment reset")
-    logger.info(f"Initial hour: {env.hour}")
-    logger.info(f"Initial step_count: {env.step_count}")
-    logger.info(f"Max steps: {env.max_steps}")
+    logger.info(f"Initial hour: {unwrapped_env.hour}")
+    logger.info(f"Initial step_count: {unwrapped_env.step_count}")
+    logger.info(f"Max steps: {unwrapped_env.max_steps}")
     
-    # Log initial observation
-    if len(obs) >= 7:
-        canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[:7]
+    # Log initial observation using schema
+    obs_keys = getattr(unwrapped_env, 'OBS_KEYS', None)
+    # Initialize observation tracking for delta calculations
+    prev_obs_dict = {}  # Previous step observation
+    curr_obs_dict = {}  # Current step observation (before action)
+    next_obs_dict = {}  # Next step observation (after action)
+    
+    if obs_keys and len(obs) == len(obs_keys):
+        # Use schema-based decoding
+        obs_dict = {key: float(obs[i]) for i, key in enumerate(obs_keys)}
+        curr_obs_dict = obs_dict.copy()  # Store current observation
+        prev_obs_dict = obs_dict.copy()  # Initialize prev with current for first step
+        logger.info("Initial Observation (using schema):")
+        if 'plant_biomass_fraction' in obs_dict:
+            logger.info(f"  Plant biomass fraction: {obs_dict['plant_biomass_fraction']:.4f}")
+        if 'plant_moisture' in obs_dict:
+            logger.info(f"  Plant moisture: {obs_dict['plant_moisture']:.4f}")
+        if 'plant_nutrient' in obs_dict:
+            logger.info(f"  Plant nutrient: {obs_dict['plant_nutrient']:.4f}")
+        # Use debug info for true values (will be available after first step)
+        logger.info(f"  Temperature (middle): (will use true value from debug info)")
+        logger.info(f"  CO2: (will use true value from debug info)")
+        if 'hw_shield_pos' in obs_dict:
+            logger.info(f"  Shield position: {obs_dict['hw_shield_pos']:.4f}")
     else:
-        canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6] if len(obs) > 6 else 0.0
-    temp = tmp_scaled * 40.0
-    logger.info("Initial Observation:")
-    logger.info(f"  Canopy: {canopy:.4f}")
-    logger.info(f"  Moisture: {moist:.4f}")
-    logger.info(f"  Nutrient: {nut:.4f}")
-    logger.info(f"  Mold probability: {pmold:.4f}")
-    logger.info(f"  Temperature (scaled): {tmp_scaled:.4f} -> {temp:.2f}°C")
-    logger.info(f"  Lux: {lux:.4f}")
-    logger.info(f"  Shield position: {shield_pos:.4f}")
+        # Fallback: log raw observation if schema not available
+        logger.info(f"Initial Observation (raw, len={len(obs)}):")
+        for i in range(min(len(obs), 10)):
+            logger.info(f"  obs[{i}]: {obs[i]:.4f}")
     
     # Log initial plant state
     logger.info("Initial Plant State:")
-    plant_state = env.plant.get_state()
+    plant_state = unwrapped_env.plant.get_state()
     logger.info(f"  Canopy: {plant_state.get('canopy', 0):.4f}")
     logger.info(f"  Moisture: {plant_state.get('moisture', 0):.4f}")
     logger.info(f"  Nutrient: {plant_state.get('nutrient', 0):.4f}")
     logger.info(f"  LAI (Leaf Area Index): {plant_state.get('LAI', 0):.4f}")
-    logger.info(f"  Total leaf biomass: {np.sum(env.plant.organs.B_leaf):.4f} g")
-    logger.info(f"  Total root biomass: {np.sum(env.plant.organs.B_root):.4f} g")
-    logger.info(f"  Total stem biomass: {np.sum(env.plant.organs.B_stem):.4f} g")
+    logger.info(f"  Total leaf biomass: {np.sum(unwrapped_env.plant.organs.B_leaf):.4f} g")
+    logger.info(f"  Total root biomass: {np.sum(unwrapped_env.plant.organs.B_root):.4f} g")
+    logger.info(f"  Total stem biomass: {np.sum(unwrapped_env.plant.organs.B_stem):.4f} g")
     logger.info(f"  Water stress: {plant_state.get('stress_water', 1.0):.4f}")
     logger.info(f"  Temperature stress: {plant_state.get('stress_temp', 1.0):.4f}")
     logger.info(f"  Nutrient stress: {plant_state.get('stress_nutrient', 1.0):.4f}")
     
     # Log initial environment state
     logger.info("Initial Environment State:")
-    logger.info(f"  Temperature: {env.env.T:.2f}°C")
-    logger.info(f"  Relative Humidity: {env.env.RH:.2f}%")
-    logger.info(f"  Light: {env.env.solar_input(env.hour):.4f}")
+    logger.info(f"  Temperature: {unwrapped_env.env.T_middle:.2f}°C")
+    logger.info(f"  Relative Humidity: {unwrapped_env.env.RH_middle:.2f}%")
+    logger.info(f"  Light: {unwrapped_env.env.solar_input(unwrapped_env.hour):.4f}")
     
     # Log initial hardware state
     logger.info("Initial Hardware State:")
-    logger.info(f"  Shield position: {env.hw.shield_pos:.4f}")
-    logger.info(f"  Fan on: {env.hw.fan_on}")
-    logger.info(f"  Energy: {env.hw.energy:.4f}")
+    logger.info(f"  Shield position: {unwrapped_env.hw.shield_pos:.4f}")
+    logger.info(f"  Fan on: {unwrapped_env.hw.fan_on}")
+    logger.info(f"  Energy: {unwrapped_env.hw.energy:.4f}")
     
     logger.info("-"*80)
     
     total_reward = 0.0
     action_history = []
+    prev_debug_info = {}  # Store previous debug info for delta calculations
     
     for t in range(steps):
         logger.info(f"\n{'='*80}")
-        logger.info(f"STEP {t+1}/{steps} | Hour {env.hour}")
+        logger.info(f"STEP {t+1}/{steps} | Hour {unwrapped_env.hour}")
         logger.info(f"{'='*80}")
         
-        # Log current observation
-        if len(obs) >= 7:
-            canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[:7]
+        # Log current observation using schema
+        obs_keys = getattr(unwrapped_env, 'OBS_KEYS', None)
+        if obs_keys and len(obs) == len(obs_keys):
+            # Use schema-based decoding
+            obs_dict = {key: float(obs[i]) for i, key in enumerate(obs_keys)}
+            curr_obs_dict = obs_dict.copy()  # Store current observation (before action)
+            logger.info("Current Observation (using schema):")
+            if 'plant_biomass_fraction' in obs_dict:
+                prev_val = prev_obs_dict.get('plant_biomass_fraction', obs_dict['plant_biomass_fraction'])
+                logger.info(f"  Plant biomass: {obs_dict['plant_biomass_fraction']:.4f} (Δ{obs_dict['plant_biomass_fraction']-prev_val:+.4f})")
+            if 'plant_moisture' in obs_dict:
+                moist = obs_dict['plant_moisture']
+                prev_moist = prev_obs_dict.get('plant_moisture', moist)
+                logger.info(f"  Moisture: {moist:.4f} (Δ{moist-prev_moist:+.4f})")
+            if 'plant_nutrient' in obs_dict:
+                nut = obs_dict['plant_nutrient']
+                prev_nut = prev_obs_dict.get('plant_nutrient', nut)
+                logger.info(f"  Nutrient: {nut:.4f} (Δ{nut-prev_nut:+.4f})")
+            # Temperature and CO2 will be logged from debug info (true values)
+            if 'hw_shield_pos' in obs_dict:
+                shield = obs_dict['hw_shield_pos']
+                prev_shield = prev_obs_dict.get('hw_shield_pos', shield)
+                logger.info(f"  Shield: {shield:.4f} (Δ{shield-prev_shield:+.4f})")
         else:
-            canopy, moist, nut, pmold, tmp_scaled, lux, shield_pos = obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6] if len(obs) > 6 else 0.0
-        temp = tmp_scaled * 40.0
-        logger.info("Current Observation:")
-        logger.info(f"  Canopy: {canopy:.4f}")
-        logger.info(f"  Moisture: {moist:.4f}")
-        logger.info(f"  Nutrient: {nut:.4f}")
-        logger.info(f"  Mold probability: {pmold:.4f}")
-        logger.info(f"  Temperature (scaled): {tmp_scaled:.4f} -> {temp:.2f}°C")
-        logger.info(f"  Lux: {lux:.4f}")
-        logger.info(f"  Shield position: {shield_pos:.4f}")
+            # Fallback for compatibility
+            if len(obs) > 0:
+                logger.info(f"Current Observation (raw, len={len(obs)}):")
+                for i in range(min(len(obs), 5)):
+                    logger.info(f"  obs[{i}]: {obs[i]:.4f}")
         
         # Determine action - use trained model if available, else naive policy
         if model:
             # Use trained PPO model
             action, _ = model.predict(obs, deterministic=True)
-            action = action.tolist() if hasattr(action, 'tolist') else list(action)
+            # FIXED: Keep as numpy array for FlattenDictAction wrapper
+            # The wrapper needs numpy array for slicing and reshaping
+            if not isinstance(action, np.ndarray):
+                action = np.array(action, dtype=np.float32)
             action_reasons = [f"PPO model decision (deterministic)"]
             logger.info("Using trained PPO model for action selection")
         else:
-            # Fallback to naive policy
-            action = [0.0, 0.0, 0.0, 0.0]  # water, fan, shield_delta, heater
+            # Fallback to naive policy - create Dict action matching environment action space
             action_reasons = []
             
+            # Initialize all action components with defaults
+            water_total = 0.0
+            fan_on = 0  # Discrete: 0=off, 1=on
+            shield_delta = 0.0
+            heater = 0.0
+            n_peltiers = getattr(unwrapped_env, 'n_peltiers', 4)
+            peltier_controls = np.zeros(n_peltiers, dtype=np.float32)
+            dose_N = 0.0
+            dose_P = 0.0
+            dose_K = 0.0
+            pH_adjust = 0.0
+            n_nozzles = getattr(unwrapped_env, 'n_nozzles', 15)
+            nozzle_mask = np.zeros(n_nozzles, dtype=np.int32)
+            co2_inject = 0.0
+            
+            # Initialize moist and temp with defaults to prevent UnboundLocalError
+            moist = 0.5  # Default normalized moisture
+            temp = 25.0  # Default temperature in °C
+            
+            # Extract values from current observation if available
+            if obs_keys and len(obs) == len(obs_keys):
+                if 'plant_moisture' in curr_obs_dict:
+                    moist = curr_obs_dict['plant_moisture']
+                # For temperature, prefer previous step's debug info (true value)
+                # Otherwise use normalized observation as fallback
+                if prev_debug_info and 'T_middle' in prev_debug_info:
+                    temp = prev_debug_info['T_middle']  # Use true value from previous step
+                elif 'env_T_middle' in curr_obs_dict:
+                    # Use normalized value as fallback (rough denormalization)
+                    temp_normalized = curr_obs_dict['env_T_middle']
+                    temp = temp_normalized * 10.0 + 25.0
+            
+            # Apply naive policy rules with guard conditions
             if moist < 0.35:
-                action[0] = 0.8  # water
+                water_total = 0.8
                 action_reasons.append(f"Low moisture ({moist:.3f} < 0.35)")
             if temp > 28.0:
-                action[1] = 1.0  # fan on
-                action[2] = 0.2  # open shield slightly
+                fan_on = 1  # Turn fan on
+                shield_delta = 0.2  # Open shield slightly
+                # Also use Peltier cooling
+                peltier_controls = np.full(len(peltier_controls), -0.5, dtype=np.float32)  # Cooling
                 action_reasons.append(f"High temperature ({temp:.2f}°C > 28°C)")
             if temp < 16.0:
-                action[3] = 0.6  # heater
+                heater = 0.6
                 action_reasons.append(f"Low temperature ({temp:.2f}°C < 16°C)")
             
             if not action_reasons:
                 action_reasons.append("No action needed (all conditions normal)")
+            
+            # Create Dict action matching environment action space
+            action = {
+                'water_total': np.array([water_total], dtype=np.float32),
+                'fan': fan_on,
+                'shield_delta': np.array([shield_delta], dtype=np.float32),
+                'heater': np.array([heater], dtype=np.float32),
+                'peltier_controls': peltier_controls,
+                'dose_N': np.array([dose_N], dtype=np.float32),
+                'dose_P': np.array([dose_P], dtype=np.float32),
+                'dose_K': np.array([dose_K], dtype=np.float32),
+                'pH_adjust': np.array([pH_adjust], dtype=np.float32),
+                'nozzle_mask': nozzle_mask,
+                'co2_inject': np.array([co2_inject], dtype=np.float32),
+            }
         
         # Log action
         logger.info("Action Selected:")
-        logger.info(f"  Water: {action[0]:.2f}")
-        logger.info(f"  Fan: {action[1]:.2f} ({'ON' if action[1] > 0.5 else 'OFF'})")
-        logger.info(f"  Shield delta: {action[2]:.2f}")
-        logger.info(f"  Heater: {action[3]:.2f}")
+        if isinstance(action, dict):
+            logger.info(f"  Water: {action['water_total'][0]:.2f}")
+            logger.info(f"  Fan: {action['fan']} ({'ON' if action['fan'] > 0 else 'OFF'})")
+            logger.info(f"  Shield delta: {action['shield_delta'][0]:.2f}")
+            logger.info(f"  Heater: {action['heater'][0]:.2f}")
+        else:
+            # Fallback for list actions (shouldn't happen now)
+            logger.info(f"  Water: {action[0]:.2f}")
+            logger.info(f"  Fan: {action[1]:.2f} ({'ON' if action[1] > 0.5 else 'OFF'})")
+            logger.info(f"  Shield delta: {action[2]:.2f}")
+            logger.info(f"  Heater: {action[3]:.2f}")
         logger.info(f"  Reasons: {', '.join(action_reasons)}")
-        action_history.append(action.copy())
+        # Store action for history (convert dict to serializable format)
+        if isinstance(action, dict):
+            action_history.append({k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in action.items()})
+        else:
+            action_history.append(action.copy() if hasattr(action, 'copy') else list(action))
         
         # Execute step
         obs, rew, terminated, truncated, info = env.step(action)
@@ -335,15 +454,15 @@ def sim_run(args):
         
         # Log plant state from info
         plant_info = info.get('plant', {})
-        plant_state = env.plant.get_state()
+        plant_state = unwrapped_env.plant.get_state()
         logger.info("Plant State After Step:")
         logger.info(f"  Canopy: {plant_state.get('canopy', 0):.4f}")
         logger.info(f"  Moisture: {plant_state.get('moisture', 0):.4f}")
         logger.info(f"  Nutrient: {plant_state.get('nutrient', 0):.4f}")
         logger.info(f"  LAI (Leaf Area Index): {plant_state.get('LAI', 0):.4f}")
-        logger.info(f"  Total leaf biomass: {np.sum(env.plant.organs.B_leaf):.4f} g")
-        logger.info(f"  Total root biomass: {np.sum(env.plant.organs.B_root):.4f} g")
-        logger.info(f"  Total stem biomass: {np.sum(env.plant.organs.B_stem):.4f} g")
+        logger.info(f"  Total leaf biomass: {np.sum(unwrapped_env.plant.organs.B_leaf):.4f} g")
+        logger.info(f"  Total root biomass: {np.sum(unwrapped_env.plant.organs.B_root):.4f} g")
+        logger.info(f"  Total stem biomass: {np.sum(unwrapped_env.plant.organs.B_stem):.4f} g")
         logger.info(f"  Water stress: {plant_state.get('stress_water', 1.0):.4f}")
         logger.info(f"  Temperature stress: {plant_state.get('stress_temp', 1.0):.4f}")
         logger.info(f"  Nutrient stress: {plant_state.get('stress_nutrient', 1.0):.4f}")
@@ -353,8 +472,8 @@ def sim_run(args):
         # Log environment state from info
         env_info = info.get('env', {})
         logger.info("Environment State After Step:")
-        logger.info(f"  Temperature: {env.env.T:.2f}°C")
-        logger.info(f"  Relative Humidity: {env_info.get('RH', env.env.RH):.2f}%")
+        logger.info(f"  Temperature: {unwrapped_env.env.T_middle:.2f}°C")
+        logger.info(f"  Relative Humidity: {env_info.get('RH', unwrapped_env.env.RH_middle):.2f}%")
         logger.info(f"  Light (L): {env_info.get('L', 0):.4f}")
         logger.info(f"  Evaporation: {env_info.get('evap', 0):.4f}")
         if env_info:
@@ -363,31 +482,109 @@ def sim_run(args):
         # Log hardware state from info
         hw_info = info.get('hw', {})
         logger.info("Hardware State After Step:")
-        logger.info(f"  Shield position: {env.hw.shield_pos:.4f}")
-        logger.info(f"  Fan on: {env.hw.fan_on}")
-        logger.info(f"  Energy consumed: {env.hw.energy:.4f}")
+        logger.info(f"  Shield position: {unwrapped_env.hw.shield_pos:.4f}")
+        logger.info(f"  Fan on: {unwrapped_env.hw.fan_on}")
+        logger.info(f"  Energy consumed: {unwrapped_env.hw.energy:.4f}")
         logger.info(f"  Delivered water: {hw_info.get('delivered_water', 0):.4f}")
         logger.info(f"  Heater power: {hw_info.get('heater_power', 0):.4f}")
+        # FIXED: Log both coverage metrics separately
+        logger.info(f"  Nozzle coverage fraction (geometry): {hw_info.get('nozzle_coverage_fraction', 0):.4f}")
+        logger.info(f"  Water delivery efficiency: {hw_info.get('water_delivery_efficiency', 0):.4f}")
         if hw_info:
             logger.info(f"  HW info: {hw_info}")
         
-        # Log new observation
-        if len(obs) >= 7:
-            new_canopy, new_moist, new_nut, new_pmold, new_tmp_scaled, new_lux, new_shield_pos = obs[:7]
+        # Log applied action from env (post-clip/scaled controls)
+        applied_action = info.get('applied_action', {})
+        if applied_action:
+            logger.info("Applied Action (post-clip/scaled):")
+            if 'water_total' in applied_action:
+                logger.info(f"  Water: {applied_action['water_total']:.4f}")
+            if 'fan' in applied_action:
+                logger.info(f"  Fan: {applied_action['fan']} ({'ON' if applied_action['fan'] else 'OFF'})")
+            if 'shield_delta' in applied_action:
+                logger.info(f"  Shield delta: {applied_action['shield_delta']:.4f}")
+            if 'heater' in applied_action:
+                logger.info(f"  Heater: {applied_action['heater']:.4f}")
+            if 'peltier_controls' in applied_action:
+                peltiers = applied_action['peltier_controls']
+                if isinstance(peltiers, (list, np.ndarray)):
+                    logger.info(f"  Peltier controls: {[f'{p:.2f}' for p in peltiers]}")
+                else:
+                    logger.info(f"  Peltier controls: {peltiers}")
+            if 'dose_N' in applied_action:
+                logger.info(f"  Dose N: {applied_action['dose_N']:.4f} g")
+            if 'dose_P' in applied_action:
+                logger.info(f"  Dose P: {applied_action['dose_P']:.4f} g")
+            if 'dose_K' in applied_action:
+                logger.info(f"  Dose K: {applied_action['dose_K']:.4f} g")
+            if 'co2_inject' in applied_action:
+                logger.info(f"  CO2 inject: {applied_action['co2_inject']:.4f} L/hour")
+        
+        # Log debug info (true state values, not decoded obs)
+        debug_info = info.get('debug', {})
+        if debug_info:
+            logger.info("Debug Info (True State):")
+            
+            T_middle = debug_info.get('T_middle', 0)
+            prev_T = prev_debug_info.get('T_middle', T_middle)
+            logger.info(f"  T_middle: {T_middle:.2f}°C (Δ{T_middle-prev_T:+.2f}°C)")
+            
+            L = debug_info.get('L', 0)
+            prev_L = prev_debug_info.get('L', L)
+            logger.info(f"  L (light): {L:.4f} (Δ{L-prev_L:+.4f})")
+            
+            CO2 = debug_info.get('CO2', 0)
+            prev_CO2 = prev_debug_info.get('CO2', CO2)
+            logger.info(f"  CO2: {CO2:.0f} ppm (Δ{CO2-prev_CO2:+.0f} ppm)")
+            
+            soil_moisture = debug_info.get('soil_moisture', 0)
+            prev_soil_moisture = prev_debug_info.get('soil_moisture', soil_moisture)
+            logger.info(f"  Soil moisture: {soil_moisture:.4f} (Δ{soil_moisture-prev_soil_moisture:+.4f})")
+            
+            shield_pos = debug_info.get('shield_pos', 0)
+            prev_shield_pos = prev_debug_info.get('shield_pos', shield_pos)
+            logger.info(f"  Shield pos: {shield_pos:.4f} (Δ{shield_pos-prev_shield_pos:+.4f})")
+            
+            logger.info(f"  Fan on: {debug_info.get('fan_on', False)}")
+            
+            # Store current debug info for next step delta calculation
+            prev_debug_info = debug_info.copy()
+        
+        # Log new observation using schema
+        obs_keys = getattr(unwrapped_env, 'OBS_KEYS', None)
+        if obs_keys and len(obs) == len(obs_keys):
+            # Use schema-based decoding
+            new_obs_dict = {key: float(obs[i]) for i, key in enumerate(obs_keys)}
+            next_obs_dict = new_obs_dict.copy()  # Store next observation (after action)
+            logger.info("New Observation:")
+            if 'plant_biomass_fraction' in new_obs_dict:
+                curr_val = curr_obs_dict.get('plant_biomass_fraction', new_obs_dict['plant_biomass_fraction'])
+                logger.info(f"  Plant biomass: {new_obs_dict['plant_biomass_fraction']:.4f} (Δ{new_obs_dict['plant_biomass_fraction']-curr_val:+.4f})")
+            if 'plant_moisture' in new_obs_dict:
+                new_moist = new_obs_dict['plant_moisture']
+                curr_moist = curr_obs_dict.get('plant_moisture', new_moist)
+                logger.info(f"  Moisture: {new_moist:.4f} (Δ{new_moist-curr_moist:+.4f})")
+            if 'plant_nutrient' in new_obs_dict:
+                new_nut = new_obs_dict['plant_nutrient']
+                curr_nut = curr_obs_dict.get('plant_nutrient', new_nut)
+                logger.info(f"  Nutrient: {new_nut:.4f} (Δ{new_nut-curr_nut:+.4f})")
+            # Temperature and CO2 deltas are logged from debug info above
+            if 'hw_shield_pos' in new_obs_dict:
+                new_shield = new_obs_dict['hw_shield_pos']
+                curr_shield = curr_obs_dict.get('hw_shield_pos', new_shield)
+                logger.info(f"  Shield position: {new_shield:.4f} (Δ{new_shield-curr_shield:+.4f})")
+            
+            # Update observation tracking: shift for next iteration
+            prev_obs_dict = curr_obs_dict.copy()  # Previous becomes current
+            curr_obs_dict = next_obs_dict.copy()  # Current becomes next
         else:
-            new_canopy, new_moist, new_nut, new_pmold, new_tmp_scaled, new_lux, new_shield_pos = obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6] if len(obs) > 6 else 0.0
-        new_temp = new_tmp_scaled * 40.0
-        logger.info("New Observation:")
-        logger.info(f"  Canopy: {new_canopy:.4f} (Δ{new_canopy-canopy:+.4f})")
-        logger.info(f"  Moisture: {new_moist:.4f} (Δ{new_moist-moist:+.4f})")
-        logger.info(f"  Nutrient: {new_nut:.4f} (Δ{new_nut-nut:+.4f})")
-        logger.info(f"  Mold probability: {new_pmold:.4f} (Δ{new_pmold-pmold:+.4f})")
-        logger.info(f"  Temperature: {new_temp:.2f}°C (Δ{new_temp-temp:+.2f}°C)")
-        logger.info(f"  Lux: {new_lux:.4f} (Δ{new_lux-lux:+.4f})")
-        logger.info(f"  Shield position: {new_shield_pos:.4f} (Δ{new_shield_pos-shield_pos:+.4f})")
+            # Fallback for compatibility
+            logger.info(f"New Observation (raw, len={len(obs)}):")
+            for i in range(min(len(obs), 5)):
+                logger.info(f"  obs[{i}]: {obs[i]:.4f}")
         
         if t % 6 == 0:
-            env.render()
+            unwrapped_env.render()
         
         if terminated or truncated:
             logger.warning(f"Episode ended: terminated={terminated}, truncated={truncated}")
@@ -398,31 +595,31 @@ def sim_run(args):
     logger.info("SIMULATION RUN COMPLETED")
     logger.info("="*80)
     logger.info(f"Total steps executed: {t+1}")
-    logger.info(f"Final hour: {env.hour}")
-    logger.info(f"Final step_count: {env.step_count}")
+    logger.info(f"Final hour: {unwrapped_env.hour}")
+    logger.info(f"Final step_count: {unwrapped_env.step_count}")
     logger.info(f"Total reward: {total_reward:.4f}")
     logger.info(f"Average reward per step: {total_reward/(t+1):.4f}")
     logger.info("\nFinal Plant State:")
-    plant_state = env.plant.get_state()
+    plant_state = unwrapped_env.plant.get_state()
     logger.info(f"  Canopy: {plant_state.get('canopy', 0):.4f}")
     logger.info(f"  Moisture: {plant_state.get('moisture', 0):.4f}")
     logger.info(f"  Nutrient: {plant_state.get('nutrient', 0):.4f}")
     logger.info(f"  Final LAI: {plant_state.get('LAI', 0):.4f}")
-    total_biomass = np.sum(env.plant.organs.B_leaf) + np.sum(env.plant.organs.B_root) + np.sum(env.plant.organs.B_stem)
+    total_biomass = np.sum(unwrapped_env.plant.organs.B_leaf) + np.sum(unwrapped_env.plant.organs.B_root) + np.sum(unwrapped_env.plant.organs.B_stem)
     logger.info(f"  Final total biomass: {total_biomass:.4f} g")
-    logger.info(f"  Final leaf biomass: {np.sum(env.plant.organs.B_leaf):.4f} g")
-    logger.info(f"  Final root biomass: {np.sum(env.plant.organs.B_root):.4f} g")
-    logger.info(f"  Final stem biomass: {np.sum(env.plant.organs.B_stem):.4f} g")
+    logger.info(f"  Final leaf biomass: {np.sum(unwrapped_env.plant.organs.B_leaf):.4f} g")
+    logger.info(f"  Final root biomass: {np.sum(unwrapped_env.plant.organs.B_root):.4f} g")
+    logger.info(f"  Final stem biomass: {np.sum(unwrapped_env.plant.organs.B_stem):.4f} g")
     logger.info(f"  Water stress: {plant_state.get('stress_water', 1.0):.4f}")
     logger.info(f"  Temperature stress: {plant_state.get('stress_temp', 1.0):.4f}")
     logger.info(f"  Nutrient stress: {plant_state.get('stress_nutrient', 1.0):.4f}")
     logger.info("\nFinal Environment State:")
-    logger.info(f"  Temperature: {env.env.T:.2f}°C")
-    logger.info(f"  Relative Humidity: {env.env.RH:.2f}%")
+    logger.info(f"  Temperature: {unwrapped_env.env.T_middle:.2f}°C")
+    logger.info(f"  Relative Humidity: {unwrapped_env.env.RH_middle:.2f}%")
     logger.info(f"\nFinal Hardware State:")
-    logger.info(f"  Shield position: {env.hw.shield_pos:.4f}")
-    logger.info(f"  Fan on: {env.hw.fan_on}")
-    logger.info(f"  Total energy consumed: {env.hw.energy:.4f}")
+    logger.info(f"  Shield position: {unwrapped_env.hw.shield_pos:.4f}")
+    logger.info(f"  Fan on: {unwrapped_env.hw.fan_on}")
+    logger.info(f"  Total energy consumed: {unwrapped_env.hw.energy:.4f}")
     logger.info(f"\nLog file saved to: {log_file}")
     logger.info("="*80)
     
@@ -483,6 +680,7 @@ def parse_args():
     s.add_argument("--dose_P", type=float, default=None, help="Phosphorus dose (0..1)")
     s.add_argument("--dose_K", type=float, default=None, help="Potassium dose (0..1)")
     s.add_argument("--no_model", action='store_true', help="Do not use a trained model")
+    s.add_argument("--full_episode", action='store_true', help="Run exactly env.max_steps (full episode)")
 
     v=sub.add_parser("analyze_sim_logs", help="Analyze simulation logs")
     v.add_argument("--log_file", type=str, default=None, help="path to log file")

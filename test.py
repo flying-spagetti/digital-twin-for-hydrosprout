@@ -1,8 +1,8 @@
 from stable_baselines3 import PPO
-from rl.gym_env import ImprovedDigitalTwinEnv
+from rl.gym_env import EnhancedDigitalTwinEnv
 import numpy as np
 
-env = ImprovedDigitalTwinEnv()
+env = EnhancedDigitalTwinEnv()
 model = PPO.load('ppo_best/best_model')  # Load best checkpoint
 
 for ep in range(3):

@@ -1,8 +1,8 @@
 {
-  "total_episodes": 896,
-  "mean_reward": 488.55150704,
-  "mean_growth": 1.9997010142132632,
-  "mean_survival": 336.0,
+  "total_episodes": 5314,
+  "mean_reward": 286.17892276999993,
+  "mean_growth": 0.9055323763878269,
+  "mean_survival": 221.15,
   "death_rate": 0.0,
-  "mean_water_efficiency": 0.3124493627637685
+  "mean_water_efficiency": 1.46456331729617
 }

@@ -28,10 +28,22 @@ A reinforcement learning-based digital twin system for automated microgreens cul
 - [Quick Start](#quick-start)
 - [Training PPO Agent](#training-ppo-agent)
 - [Running Simulations](#running-simulations)
+- [Complete Command Reference](#complete-command-reference)
 - [Visualization & Analysis](#visualization--analysis)
 - [Configuration](#configuration)
 - [Advanced Usage](#advanced-usage)
 - [Troubleshooting](#troubleshooting)
+
+## 📚 Documentation
+
+- **[COMMANDS_README.md](COMMANDS_README.md)** - Complete command reference with all options and examples
+- **[OBSERVATION_ACTION_SCHEMA.md](OBSERVATION_ACTION_SCHEMA.md)** - Detailed observation and action schema documentation
+- [Complete Command Reference](#complete-command-reference)
+
+## 📚 Documentation
+
+- **[COMMANDS_README.md](COMMANDS_README.md)** - Complete command reference with all options and examples
+- **[OBSERVATION_ACTION_SCHEMA.md](OBSERVATION_ACTION_SCHEMA.md)** - Detailed observation and action schema documentation
 
 ## 🚀 Installation
 
@@ -191,6 +203,17 @@ tensorboard --logdir ppo_tensorboard
 ```
 
 Then open `http://localhost:6006` in your browser.
+
+## 📚 Complete Command Reference
+
+For comprehensive documentation of all commands, options, and examples, see:
+
+**[COMMANDS_README.md](COMMANDS_README.md)** - Complete command reference with:
+- All main.py commands (gen_synth, demo_ppo, train_classifier, sim_run, analyze_sim_logs, sample_visual)
+- All rl/train_ppo.py training options
+- Evaluation commands (evaluate_policy.py)
+- Common workflows and troubleshooting
+- Schema documentation reference
 
 ## 🧪 Running Simulations
 

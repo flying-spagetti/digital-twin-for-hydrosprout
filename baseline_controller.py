@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
+    from rl.gym_env import EnhancedDigitalTwinEnv as DigitalTwinEnv
 except ImportError:
     print("Could not import gym_env. Make sure you're in the correct directory.")
     sys.exit(1)

@@ -160,7 +160,7 @@ def validate_water_action_effect():
     print("="*70)
     
     try:
-        from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
+        from rl.gym_env import EnhancedDigitalTwinEnv as DigitalTwinEnv
         env = DigitalTwinEnv()
         
         print("\n1. Testing NO water action")
@@ -225,7 +225,7 @@ def validate_reward_structure():
     print("="*70)
     
     try:
-        from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
+        from rl.gym_env import EnhancedDigitalTwinEnv as DigitalTwinEnv
         env = DigitalTwinEnv()
         
         print("\n1. Testing normal operation")
@@ -288,7 +288,7 @@ def validate_curriculum():
     print("="*70)
     
     try:
-        from rl.gym_env import ImprovedDigitalTwinEnv as DigitalTwinEnv
+        from rl.gym_env import EnhancedDigitalTwinEnv as DigitalTwinEnv
         from rl.curriculum import CurriculumScheduler, CurriculumWrapper
         
         print("\n1. Creating curriculum scheduler")
